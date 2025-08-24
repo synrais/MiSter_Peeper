@@ -1,5 +1,5 @@
-// mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output
-// Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  center_rgb=#RRGGBB
+// mister_peeper.cpp — per-frame, buffer-aware, hash-based unchanged timer, minimal output
+// Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  color=Name
 
 #include <cstdint>
 #include <cstdio>
@@ -14,7 +14,7 @@
 #include <time.h>
 
 static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
-static constexpr double kTolerance = 3.0;  // L1 delta on avg RGB to count as "changed"
+// kTolerance removed: unchanged is now driven purely by the hash
 static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;
 static constexpr size_t MAP_LEN         = 2048u * 1024u * 12u; // ~24 MiB
 
@@ -56,6 +56,26 @@ static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){
 static inline void fmt_hms(double s,char* out,size_t n){
     int S=(int)s; int H=S/3600; int M=(S%3600)/60; S%=60;
     snprintf(out,n,"%02d:%02d:%02d",H,M,S);
+}
+
+// Simple nearest-named-color mapper (RGB Euclidean)
+struct NamedColor { const char* name; uint8_t r,g,b; };
+static const NamedColor kNamed[] = {
+    {"Black",0,0,0}, {"White",255,255,255}, {"Silver",192,192,192}, {"Gray",128,128,128},
+    {"Red",255,0,0}, {"Maroon",128,0,0}, {"Orange",255,165,0}, {"Brown",165,42,42},
+    {"Yellow",255,255,0}, {"Olive",128,128,0}, {"Lime",0,255,0}, {"Green",0,128,0},
+    {"Cyan",0,255,255}, {"Teal",0,128,128}, {"Blue",0,0,255}, {"Navy",0,0,128},
+    {"Magenta",255,0,255}, {"Purple",128,0,128}, {"Pink",255,192,203}
+};
+static inline const char* name_for_rgb(unsigned R, unsigned G, unsigned B){
+    const char* best="Unknown";
+    unsigned best_d=~0u;
+    for(const auto& c: kNamed){
+        int dr=(int)R-(int)c.r, dg=(int)G-(int)c.g, db=(int)B-(int)c.b;
+        unsigned d=(unsigned)(dr*dr + dg*dg + db*db);
+        if(d<best_d){ best_d=d; best=c.name; }
+    }
+    return best;
 }
 
 int main(){
@@ -121,7 +141,6 @@ int main(){
     // Change detection state
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
-    double last_r=-1,last_g=-1,last_b=-1;
 
     // Previous per-buffer counters (casts silence narrowing warnings)
     uint8_t prev_fc[3] = {
@@ -131,9 +150,10 @@ int main(){
     };
 
     while(g_run){
-        // Wait for next frame (≈ refresh rate). Polled gently.
+        // Wait for next frame; poll gently at ~100 Hz (10 ms)
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(1000);
+        while(g_run && sum_fc()==s0) usleep(10000); // 100 Hz lock
+
         if(!g_run) break;
 
         // Pick active buffer (the one that ticked)
@@ -181,44 +201,27 @@ int main(){
             }
         }
 
-        // Center pixel from the same buffer
-        unsigned cx=width/2, cy=height/2;
-        uint8_t Rc=0,Gc=0,Bc=0;
-        if(fmt==RGB24){
-            const volatile uint8_t* p=pix + (size_t)cy*line + (size_t)cx*3; Rc=p[0]; Gc=p[1]; Bc=p[2];
-        } else if(fmt==RGBA32){
-            const volatile uint8_t* p=pix + (size_t)cy*line + (size_t)cx*4; Rc=p[0]; Gc=p[1]; Bc=p[2];
-        } else {
-            const volatile uint8_t* p=pix + (size_t)cy*line + (size_t)cx*2; uint8_t r,g,b; load_rgb565(p,r,g,b); Rc=r;Gc=g;Bc=b;
-        }
-
-        // Change detection (hash + tolerance on avg)
+        // Change detection: hash only
         uint64_t t_ns=now_ns();
-        double r_avg = n? (double)rs/n : 0.0;
-        double g_avg = n? (double)gs/n : 0.0;
-        double b_avg = n? (double)bs/n : 0.0;
-
         if(first){
-            last_hash=hsh; last_change_ns=t_ns;
-            last_r=r_avg; last_g=g_avg; last_b=b_avg;
-            first=false;
+            last_hash=hsh; last_change_ns=t_ns; first=false;
         } else if(hsh!=last_hash){
-            double dr=fabs(r_avg-last_r), dg=fabs(g_avg-last_g), db=fabs(b_avg-last_b);
-            if((dr+dg+db) >= kTolerance){
-                last_change_ns=t_ns;
-                last_hash=hsh; last_r=r_avg; last_g=g_avg; last_b=b_avg;
-            } else {
-                last_hash=hsh; // small drift: track hash, keep timer
-            }
+            last_hash=hsh;
+            last_change_ns=t_ns;
         }
 
+        // Averages and presentation
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
-        unsigned R=(unsigned)r_avg, G=(unsigned)g_avg, B=(unsigned)b_avg;
 
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  center_rgb=#%02X%02X%02X\n",
-               tbuf, unchanged_s, R,G,B, Rc,Gc,Bc);
+        unsigned R=(unsigned)(n? (double)rs/n : 0.0);
+        unsigned G=(unsigned)(n? (double)gs/n : 0.0);
+        unsigned B=(unsigned)(n? (double)bs/n : 0.0);
+        const char* cname = name_for_rgb(R,G,B);
+
+        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s\n",
+               tbuf, unchanged_s, R,G,B, cname);
         fflush(stdout);
     }
 
