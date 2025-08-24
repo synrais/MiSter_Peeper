@@ -272,10 +272,6 @@ int main(){
     uint8_t  last_fmt    = (uint8_t)fmt;
     uint16_t last_header_len = header_len;
 
-    // Pixel loaders for 24/32-bit
-    auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
-    auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
-
     // Hash-only change detection state
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
@@ -331,19 +327,21 @@ int main(){
                     (unsigned)cur_fmt_u8,(unsigned)cur_triple);
         }
 
-        // Pick active buffer (the one that ticked)
+        // Pick active buffer (the one whose frame counter advanced, modulo 256)
         uint8_t curr_fc[3] = {
             attr_ptrs[0][0],
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
             static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
         };
-        int idx=0;
+        int buf = 0;
         if(triple){
-            for(int i=0;i<3;i++) if(curr_fc[i]!=prev_fc[i]) { idx=i; break; }
-            if(curr_fc[1]>=curr_fc[idx]) idx=1;
-            if(curr_fc[2]>=curr_fc[idx]) idx=2;
+            uint8_t diff0 = static_cast<uint8_t>(curr_fc[0] - prev_fc[0]);
+            uint8_t diff1 = static_cast<uint8_t>(curr_fc[1] - prev_fc[1]);
+            uint8_t diff2 = static_cast<uint8_t>(curr_fc[2] - prev_fc[2]);
+            buf = (diff1 > diff0) ? 1 : 0;
+            uint8_t best = (buf == 1) ? diff1 : diff0;
+            if(diff2 > best) buf = 2;
         }
-        int buf = idx;
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
         // Address of active frame pixels
@@ -353,7 +351,13 @@ int main(){
         uint32_t hsh=2166136261u;
 
         // Epoch for this frame (avoid clearing 64k histogram)
-        uint32_t const epoch = ++g_epoch; // wrap ok (equality check)
+        if(++g_epoch==0){
+            // Wrapped: clear histogram and skip epoch 0
+            memset(g_stamp,0,sizeof(g_stamp));
+            memset(g_count,0,sizeof(g_count));
+            ++g_epoch;
+        }
+        uint32_t const epoch = g_epoch;
 
         // On-the-fly mode tracking (dominant bin)
         uint32_t mode_key = 0;
@@ -364,8 +368,7 @@ int main(){
                 const volatile uint8_t* row=pix + (size_t)y*last_line;
                 for(unsigned x=0;x<last_width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*3;
-                    uint8_t r=g_stamp[0], g=g_stamp[0], b=g_stamp[0]; // init suppresses warnings; overwritten below
-                    r=p[0]; g=p[1]; b=p[2];
+                    uint8_t r=p[0], g=p[1], b=p[2];
                     hsh=hash_rgb(hsh,r,g,b);
                     uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
