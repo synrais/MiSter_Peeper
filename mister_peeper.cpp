@@ -1,6 +1,5 @@
 // mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output
 // Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  center_rgb=#RRGGBB
-// Strategy: wait for next frame -> pick the buffer whose counter changed -> sample once -> print.
 
 #include <cstdint>
 #include <cstdio>
@@ -100,7 +99,7 @@ int main(){
     // Helpers
     auto sum_fc=[&](){
         uint16_t s = attr_ptrs[0][0];
-        if(triple){ s += attr_ptrs[1][0] + attr_ptrs[2][0]; }
+        if(triple){ s = (uint16_t)(s + attr_ptrs[1][0] + attr_ptrs[2][0]); }
         return s;
     };
     auto choose_active_idx = [&](const uint8_t prev[3], const uint8_t curr[3])->int{
@@ -114,7 +113,9 @@ int main(){
     auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgb565=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){
         uint16_t v=(uint16_t)p[0]|((uint16_t)p[1]<<8);
-        r=((v>>11)&0x1F)*255/31; g=((v>>5)&0x3F)*255/63; b=(v&0x1F)*255/31;
+        r=(uint8_t)(((v>>11)&0x1F)*255/31);
+        g=(uint8_t)(((v>>5)&0x3F)*255/63);
+        b=(uint8_t)(( v     &0x1F)*255/31);
     };
 
     // Change detection state
@@ -122,8 +123,12 @@ int main(){
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
     double last_r=-1,last_g=-1,last_b=-1;
 
-    // Previous per-buffer counters
-    uint8_t prev_fc[3] = { attr_ptrs[0][0], triple?attr_ptrs[1][0]:0, triple?attr_ptrs[2][0]:0 };
+    // Previous per-buffer counters (casts silence narrowing warnings)
+    uint8_t prev_fc[3] = {
+        attr_ptrs[0][0],
+        static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
+        static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
+    };
 
     while(g_run){
         // Wait for next frame (≈ refresh rate). Polled gently.
@@ -132,7 +137,11 @@ int main(){
         if(!g_run) break;
 
         // Pick active buffer (the one that ticked)
-        uint8_t curr_fc[3] = { attr_ptrs[0][0], triple?attr_ptrs[1][0]:0, triple?attr_ptrs[2][0]:0 };
+        uint8_t curr_fc[3] = {
+            attr_ptrs[0][0],
+            static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
+            static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
+        };
         int buf = choose_active_idx(prev_fc, curr_fc);
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
