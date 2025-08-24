@@ -1,6 +1,6 @@
 // mister_peeper.cpp — frame-paced, hash-timed unchanged, avg & dominant color
 // Prints once per new frame:
-//   time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  dom_rgb=#RRGGBB
+//   time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB (Name)  dom_rgb=#RRGGBB (Name)
 
 #include <cstdint>
 #include <cstdio>
@@ -72,6 +72,26 @@ static inline uint8_t lin_to_srgb(double lin){
     if(lin<=0.0) return 0; if(lin>=1.0) return 255;
     double s = (lin<=0.0031308)? 12.92*lin : 1.055*pow(lin,1.0/2.4)-0.055;
     int v=(int)llround(s*255.0); return (v<0?0:v>255?255:v);
+}
+
+// --- human-readable palette ---
+struct NamedColor { const char* name; uint8_t r,g,b; };
+static const NamedColor kNamed[] = {
+    {"Black",0,0,0}, {"White",255,255,255}, {"Silver",192,192,192}, {"Gray",128,128,128},
+    {"Red",255,0,0}, {"Maroon",128,0,0}, {"Orange",255,165,0}, {"Brown",165,42,42},
+    {"Yellow",255,255,0}, {"Olive",128,128,0}, {"Lime",0,255,0}, {"Green",0,128,0},
+    {"Cyan",0,255,255}, {"Teal",0,128,128}, {"Blue",0,0,255}, {"Navy",0,0,128},
+    {"Magenta",255,0,255}, {"Purple",128,0,128}, {"Pink",255,192,203}
+};
+static inline const char* name_for_rgb(unsigned R, unsigned G, unsigned B){
+    const char* best="Unknown";
+    unsigned best_d=~0u;
+    for(const auto& c: kNamed){
+        int dr=(int)R-(int)c.r, dg=(int)G-(int)c.g, db=(int)B-(int)c.b;
+        unsigned d=(unsigned)(dr*dr + dg*dg + db*db);
+        if(d<best_d){ best_d=d; best=c.name; }
+    }
+    return best;
 }
 
 int main(){
@@ -157,8 +177,8 @@ int main(){
         uint32_t hsh=2166136261u;
 
         // histogram bins
-        static const int B=32; // 5 bits
-        static uint32_t hist[B*B*B];
+        static const int kBins=32; // 5 bits/channel
+        static uint32_t hist[kBins*kBins*kBins];
         memset(hist,0,sizeof(hist));
 
         auto bin = [&](uint8_t r,uint8_t g,uint8_t b){
@@ -213,7 +233,7 @@ int main(){
 
         // dominant color from histogram
         int best_i=0; uint32_t best_c=0;
-        for(int i=0;i<B*B*B;i++) if(hist[i]>best_c){ best_c=hist[i]; best_i=i; }
+        for(int i=0;i<kBins*kBins*kBins;i++) if(hist[i]>best_c){ best_c=hist[i]; best_i=i; }
         int rb=(best_i>>10)&31, gb=(best_i>>5)&31, bb=best_i&31;
         uint8_t Rd=rb*8+4, Gd=gb*8+4, Bd=bb*8+4;
 
@@ -221,8 +241,10 @@ int main(){
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
 
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  dom_rgb=#%02X%02X%02X\n",
-               tbuf, unchanged_s, R,G,B, Rd,Gd,Bd);
+        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X (%s)  dom_rgb=#%02X%02X%02X (%s)\n",
+               tbuf, unchanged_s,
+               R,G,B,  name_for_rgb(R,G,B),
+               Rd,Gd,Bd, name_for_rgb(Rd,Gd,Bd));
         fflush(stdout);
     }
 
