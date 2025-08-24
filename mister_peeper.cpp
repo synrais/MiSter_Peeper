@@ -1,5 +1,5 @@
-// mister_peeper.cpp — per-frame, buffer-aware, hash-based unchanged timer, minimal output
-// Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  color=Name
+// mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output
+// Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB (Name)  dom_rgb=#RRGGBB (Name)
 
 #include <cstdint>
 #include <cstdio>
@@ -12,9 +12,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
+#include <unordered_map>
+#include <utility>
 
 static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
-// kTolerance removed: unchanged is now driven purely by the hash
+// kTolerance removed from logic: unchanged is based on hash-only now
 static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;
 static constexpr size_t MAP_LEN         = 2048u * 1024u * 12u; // ~24 MiB
 
@@ -58,24 +60,26 @@ static inline void fmt_hms(double s,char* out,size_t n){
     snprintf(out,n,"%02d:%02d:%02d",H,M,S);
 }
 
-// Simple nearest-named-color mapper (RGB Euclidean)
+// ---- Simple nearest-name color mapping for human readability ----
 struct NamedColor { const char* name; uint8_t r,g,b; };
-static const NamedColor kNamed[] = {
-    {"Black",0,0,0}, {"White",255,255,255}, {"Silver",192,192,192}, {"Gray",128,128,128},
-    {"Red",255,0,0}, {"Maroon",128,0,0}, {"Orange",255,165,0}, {"Brown",165,42,42},
-    {"Yellow",255,255,0}, {"Olive",128,128,0}, {"Lime",0,255,0}, {"Green",0,128,0},
-    {"Cyan",0,255,255}, {"Teal",0,128,128}, {"Blue",0,0,255}, {"Navy",0,0,128},
-    {"Magenta",255,0,255}, {"Purple",128,0,128}, {"Pink",255,192,203}
+static constexpr NamedColor kPalette[] = {
+    {"Black",0,0,0},{"White",255,255,255},{"Red",255,0,0},{"Lime",0,255,0},
+    {"Blue",0,0,255},{"Yellow",255,255,0},{"Cyan",0,255,255},{"Magenta",255,0,255},
+    {"Silver",192,192,192},{"Gray",128,128,128},{"Maroon",128,0,0},{"Olive",128,128,0},
+    {"Green",0,128,0},{"Purple",128,0,128},{"Teal",0,128,128},{"Navy",0,0,128},
+    {"Orange",255,165,0},{"Pink",255,192,203},{"Brown",165,42,42},{"Gold",255,215,0}
 };
-static inline const char* name_for_rgb(unsigned R, unsigned G, unsigned B){
-    const char* best="Unknown";
-    unsigned best_d=~0u;
-    for(const auto& c: kNamed){
-        int dr=(int)R-(int)c.r, dg=(int)G-(int)c.g, db=(int)B-(int)c.b;
-        unsigned d=(unsigned)(dr*dr + dg*dg + db*db);
-        if(d<best_d){ best_d=d; best=c.name; }
+static inline const char* nearest_color_name(uint8_t r,uint8_t g,uint8_t b){
+    int best_i = 0;
+    int best_d = INT32_MAX;
+    for(size_t i=0;i<sizeof(kPalette)/sizeof(kPalette[0]);++i){
+        int dr = (int)r - (int)kPalette[i].r;
+        int dg = (int)g - (int)kPalette[i].g;
+        int db = (int)b - (int)kPalette[i].b;
+        int d = dr*dr + dg*dg + db*db;
+        if(d < best_d){ best_d = d; best_i = (int)i; }
     }
-    return best;
+    return kPalette[best_i].name;
 }
 
 int main(){
@@ -138,7 +142,7 @@ int main(){
         b=(uint8_t)(( v     &0x1F)*255/31);
     };
 
-    // Change detection state
+    // Change detection state (hash-only)
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
 
@@ -150,10 +154,9 @@ int main(){
     };
 
     while(g_run){
-        // Wait for next frame; poll gently at ~100 Hz (10 ms)
+        // Wait for next frame (≈ refresh rate). Polled gently.
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(10000); // 100 Hz lock
-
+        while(g_run && sum_fc()==s0) usleep(1000);
         if(!g_run) break;
 
         // Pick active buffer (the one that ticked)
@@ -172,6 +175,10 @@ int main(){
         uint64_t rs=0,gs=0,bs=0,n=0;
         uint32_t hsh=2166136261u;
 
+        // Dominant color counting (over sampled grid)
+        std::unordered_map<uint32_t,uint32_t> hist;
+        hist.reserve(1u<<16);
+
         if(fmt==RGB24){
             for(unsigned y=0;y<height;y+=ys){
                 const volatile uint8_t* row=pix + (size_t)y*line;
@@ -179,6 +186,8 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
                     rs+=r; gs+=g; bs+=b; n++; hsh=hash_rgb(hsh,r,g,b);
+                    uint32_t key = ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    ++hist[key];
                 }
             }
         } else if(fmt==RGBA32){
@@ -188,6 +197,8 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
                     rs+=r; gs+=g; bs+=b; n++; hsh=hash_rgb(hsh,r,g,b);
+                    uint32_t key = ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    ++hist[key];
                 }
             }
         } else { // RGB16
@@ -197,6 +208,8 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; load_rgb565(p,r,g,b);
                     rs+=r; gs+=g; bs+=b; n++; hsh=hash_rgb(hsh,r,g,b);
+                    uint32_t key = ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+                    ++hist[key];
                 }
             }
         }
@@ -206,22 +219,39 @@ int main(){
         if(first){
             last_hash=hsh; last_change_ns=t_ns; first=false;
         } else if(hsh!=last_hash){
-            last_hash=hsh;
             last_change_ns=t_ns;
+            last_hash=hsh;
         }
 
-        // Averages and presentation
+        // Averages
+        double r_avg = n? (double)rs/n : 0.0;
+        double g_avg = n? (double)gs/n : 0.0;
+        double b_avg = n? (double)bs/n : 0.0;
+        unsigned R=(unsigned)r_avg, G=(unsigned)g_avg, B=(unsigned)b_avg;
+
+        // Dominant color (mode of sampled colors)
+        uint32_t dom_key = 0; uint32_t dom_count = 0;
+        for(const auto& kv : hist){
+            if(kv.second > dom_count || (kv.second==dom_count && kv.first < dom_key)){
+                dom_key = kv.first; dom_count = kv.second;
+            }
+        }
+        uint8_t Rd = (uint8_t)((dom_key>>16)&0xFF);
+        uint8_t Gd = (uint8_t)((dom_key>>8 )&0xFF);
+        uint8_t Bd = (uint8_t)( dom_key      &0xFF);
+
+        // Output
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
 
-        unsigned R=(unsigned)(n? (double)rs/n : 0.0);
-        unsigned G=(unsigned)(n? (double)gs/n : 0.0);
-        unsigned B=(unsigned)(n? (double)bs/n : 0.0);
-        const char* cname = name_for_rgb(R,G,B);
+        const char* avg_name = nearest_color_name((uint8_t)R,(uint8_t)G,(uint8_t)B);
+        const char* dom_name = nearest_color_name(Rd,Gd,Bd);
 
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s\n",
-               tbuf, unchanged_s, R,G,B, cname);
+        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X (%s)  dom_rgb=#%02X%02X%02X (%s)\n",
+               tbuf, unchanged_s,
+               R,G,B, avg_name,
+               Rd,Gd,Bd, dom_name);
         fflush(stdout);
     }
 
