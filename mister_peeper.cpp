@@ -1,6 +1,6 @@
-// mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output + inline FPS
+// mister_peeper.cpp — per-frame, buffer-aware, minimal output + inline FPS + signature
 // Each frame prints:
-//   time=HH:MM:SS  unchanged=secs  fps=XX.X  avg_rgb=#RRGGBB  center_rgb=#RRGGBB
+//   time=HH:MM:SS  unchanged=secs  fps=XX.X  sig=0xXXXXXXXX  avg_rgb=#RRGGBB  center_rgb=#RRGGBB
 
 #include <cstdint>
 #include <cstdio>
@@ -47,7 +47,9 @@ static volatile bool g_run=true;
 static void on_sig(int){ g_run=false; }
 
 static inline uint64_t now_ns(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec; }
-static inline void    sleep_200us(){ struct timespec rq{0,200000}; nanosleep(&rq,nullptr); } // 0.2 ms high-res sleep
+static inline void nsleep(long ns){ struct timespec rq{0,ns}; nanosleep(&rq,nullptr); }
+static inline void nanosnooze(){ nsleep(1000000L); }         // 1 ms
+static inline void short_relax(){ asm volatile("" ::: "memory"); } // compiler barrier
 
 static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){
     h^=((uint32_t)r<<16)^((uint32_t)g<<8)^(uint32_t)b; h^=h<<13; h^=h>>17; h^=h<<5; return h;
@@ -80,6 +82,7 @@ int main(){
     };
     bool large = triple && !hdr_ok(0x00200000u) && hdr_ok(0x00800000u);
 
+    // Attribute pointers (frame counters at header+5)
     volatile const uint8_t* attr_ptrs[3] = {
         base + 5,
         base + fb_off(large,1) + 5,
@@ -114,12 +117,23 @@ int main(){
     // FPS EMA
     uint64_t last_frame_ns = start_ns;
     double fps_ema = 0.0;
-    const double alpha = 0.2; // smoothing
+    const double alpha = 0.2;
 
     while(g_run){
-        // wait for next frame using high-res nanosleep to avoid 10ms rounding
+        // Adaptive wait: spin ≤2ms, then 1ms nap, repeat until counter changes
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) sleep_200us();
+        for(;;){
+            bool changed = false;
+            uint64_t spin_start = now_ns();
+            while(((now_ns()-spin_start) < 2'000'000ULL)) { // 2 ms
+                if(sum_fc()!=s0){ changed=true; break; }
+                short_relax();
+            }
+            if(changed) break;
+            nanosnooze(); // gentle 1ms sleep to keep CPU tiny
+            if(sum_fc()!=s0) break;
+            if(!g_run) break;
+        }
         if(!g_run) break;
 
         uint8_t curr_fc[3] = {
@@ -180,6 +194,7 @@ int main(){
         double g_avg = n? (double)gs/n : 0.0;
         double b_avg = n? (double)bs/n : 0.0;
 
+        static double last_r=-1,last_g=-1,last_b=-1;
         if(first){
             last_hash=hsh; last_change_ns=t_ns; last_r=r_avg; last_g=g_avg; last_b=b_avg; first=false;
         } else if(hsh!=last_hash){
@@ -192,15 +207,15 @@ int main(){
         double frame_dt = (t_ns - last_frame_ns) / 1e9;
         last_frame_ns = t_ns;
         double fps_inst = frame_dt > 0 ? 1.0 / frame_dt : 0.0;
-        fps_ema = (fps_ema==0.0) ? fps_inst : (alpha*fps_inst + (1.0-alpha)*fps_ema);
+        fps_ema = (fps_ema==0.0) ? fps_inst : (0.2*fps_inst + 0.8*fps_ema);
 
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
         unsigned R=(unsigned)r_avg, G=(unsigned)g_avg, B=(unsigned)b_avg;
 
-        printf("time=%s  unchanged=%.3f  fps=%.1f  avg_rgb=#%02X%02X%02X  center_rgb=#%02X%02X%02X\n",
-               tbuf, unchanged_s, fps_ema, R,G,B, Rc,Gc,Bc);
+        printf("time=%s  unchanged=%.3f  fps=%.1f  sig=0x%08X  avg_rgb=#%02X%02X%02X  center_rgb=#%02X%02X%02X\n",
+               tbuf, unchanged_s, fps_ema, hsh, R,G,B, Rc,Gc,Bc);
         fflush(stdout);
     }
 
