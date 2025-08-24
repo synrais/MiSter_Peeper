@@ -420,7 +420,7 @@ int main(){
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
         const char* dom_name = nearest_color_name(Rd,Gd,Bd);
 
-        printf("time=%s  unchanged=%.3f  dom_rgb=#%02X%02X%02X (%s)\n",
+        printf("time=%s  unchanged=%.3f  rgb=#%02X%02X%02X (%s)\n",
                tbuf, unchanged_s, Rd, Gd, Bd, dom_name);
         fflush(stdout);
     }
