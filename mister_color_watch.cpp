@@ -8,12 +8,18 @@
 //   g++ -O3 -pipe -s -std=gnu++17 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
 //       mister_color_watch.cpp -o mister_color_watch
 //
+// Cross-compile static (musl recommended) and copy to MiSTer:
+//   arm-linux-musleabihf-g++ -O3 -pipe -s -std=gnu++17 \
+//     -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
+//     mister_color_watch.cpp -o mister_color_watch
+//
 // Run (needs root for /dev/mem):
 //   sudo ./mister_color_watch
 //
 // Flags (optional):
-//   --step N       sample every Nth pixel (default 16; 1 = full scan)
-//   --sleep-us N   microseconds between polls (default 2500; 0 = no sleep)
+//   --step N         sample every Nth pixel (default 16; 1 = full scan)
+//   --sleep-us N     microseconds between polls (default 2500; 0 = no sleep)
+//   --tolerance F    change tolerance in avg RGB units (0..~10; default 0)
 
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +27,7 @@
 #include <cstring>
 #include <cerrno>
 #include <csignal>
+#include <cmath>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -41,10 +48,10 @@ static inline uint32_t hash_rgb(uint32_t h, uint8_t r, uint8_t g, uint8_t b){
     return h;
 }
 
-// --- Constants from MiSTer framebuffer helpers (public crate) ---
+// --- Constants from MiSTer framebuffer helpers (public) ---
 // Base address and triple-buffer offsets. RGB formats enum matches MiSTer.
-static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;           // scaler base
-static constexpr size_t MAP_LEN        = 2048u * 1024u * 3u * 4u; // safe window (~24MB)
+static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;            // scaler base
+static constexpr size_t MAP_LEN        = 2048u * 1024u * 12u;     // ~24 MiB window
 enum ScalerPixelFormat : uint8_t { RGB16 = 0, RGB24 = 1, RGBA32 = 2, INVALID=0xFF };
 
 // ASCAL header layout (packed, big-endian u16 fields).
@@ -53,7 +60,7 @@ struct FbHeader {
     uint8_t  ty;                // = 0x01 for scaler buffer
     uint8_t  pixel_fmt;         // 0=RGB565,1=RGB888,2=RGBA8888
     uint16_t header_len_be;     // bytes
-    uint16_t attributes_be;     // bit 4 triple-buffered; bits 7..5 = "frame counter"
+    uint16_t attributes_be;     // bit4 triple-buffered; bits7..5 frame counter
     uint16_t width_be;
     uint16_t height_be;
     uint16_t line_be;           // stride in bytes
@@ -64,11 +71,6 @@ struct FbHeader {
 
 // read big-endian 16-bit
 static inline uint16_t be16(uint16_t x){ return (uint16_t)((x>>8) | (x<<8)); }
-
-static inline uint8_t frame_counter_from_attr(uint16_t attr_be){
-    uint16_t attr = be16(attr_be);
-    return (uint8_t)((attr >> 5) & 0x07);
-}
 
 static inline bool triple_buffered(uint16_t attr_be){
     return (be16(attr_be) & (1u<<4)) != 0;
@@ -85,13 +87,24 @@ static inline size_t fb_offset_for_index(bool triple_large, uint8_t index){
     }
 }
 
-struct Opts { int step=16; int sleep_us=2500; } opts;
+struct Opts {
+    int step = 16;
+    int sleep_us = 2500;
+    double tolerance = 0.0;   // L1 distance on avg RGB; 0 = disabled
+} opts;
 
 static bool parse_args(int argc, char** argv){
     for(int i=1;i<argc;i++){
-        if(!strcmp(argv[i],"--step") && i+1<argc) { opts.step = atoi(argv[++i]); if(opts.step<1) opts.step=1; }
-        else if(!strcmp(argv[i],"--sleep-us") && i+1<argc) { opts.sleep_us = atoi(argv[++i]); if(opts.sleep_us<0) opts.sleep_us=0; }
-        else { fprintf(stderr,"Unknown option: %s\n", argv[i]); return false; }
+        if(!strcmp(argv[i],"--step") && i+1<argc) {
+            opts.step = std::max(1, atoi(argv[++i]));
+        } else if(!strcmp(argv[i],"--sleep-us") && i+1<argc) {
+            opts.sleep_us = atoi(argv[++i]); if(opts.sleep_us < 0) opts.sleep_us = 0;
+        } else if(!strcmp(argv[i],"--tolerance") && i+1<argc) {
+            opts.tolerance = atof(argv[++i]); if(opts.tolerance < 0) opts.tolerance = 0.0;
+        } else {
+            fprintf(stderr,"Unknown option: %s\n", argv[i]);
+            return false;
+        }
     }
     return true;
 }
@@ -111,7 +124,7 @@ int main(int argc, char** argv){
     FbHeader h{};
     memcpy((void*)&h, (const void*)base, sizeof(FbHeader));
     if(h.ty != 0x01){
-        fprintf(stderr,"Scaler header not found at 0x%08zx (ty=%u). Is the scaler running?\n",
+        fprintf(stderr,"error=header_not_found addr=0x%08zx ty=%u\n",
                 FB_BASE_ADDRESS, (unsigned)h.ty);
         munmap(map, MAP_LEN); close(fd); return 3;
     }
@@ -128,62 +141,58 @@ int main(int argc, char** argv){
     auto read_header_at = [&](size_t off, FbHeader& out)->bool{
         if(off + sizeof(FbHeader) > MAP_LEN) return false;
         memcpy((void*)&out, (const void*)(base + off), sizeof(FbHeader));
-        return out.ty == 0x01;
+        return out.ty == 0x01 && out.pixel_fmt <= 2;
     };
     bool triple_large=false;
     if(is_triple){
         FbHeader h_small{}, h_large{};
         bool small_ok = read_header_at(0x00200000u, h_small);
         bool large_ok = read_header_at(0x00800000u, h_large);
-        triple_large = large_ok && h_large.ty==0x01 && h_large.pixel_fmt<=2;
+        triple_large = large_ok && !small_ok; // prefer large if only large is valid
     }
 
     fprintf(stdout,
-        "MiSTer scaler detected @0x%08zx\n"
-        "  fmt=%s  header_len=%u  triple=%s  %ux%u  line=%u\n"
-        "  sampling step=%d  sleep=%d us\n",
+        "info=detected addr=0x%08zx fmt=%s header_len=%u triple=%s size=%ux%u line=%u step=%d sleep_us=%d tol=%.2f\n",
         FB_BASE_ADDRESS,
         (fmt==RGB24?"RGB24":fmt==RGBA32?"RGBA32":fmt==RGB16?"RGB16":"INVALID"),
         (unsigned)header_len, is_triple? (triple_large?"large":"small"):"no",
         (unsigned)width,(unsigned)height,(unsigned)line,
-        opts.step, opts.sleep_us);
+        opts.step, opts.sleep_us, opts.tolerance);
     fflush(stdout);
 
-    // frame counter pointers for up to 3 buffers (header byte index 5 in MiSTer helper)
-    // In the Rust helper this is "attributes" field; summing 3 counters is used to wait for changes.
+    // frame counter pointers for up to 3 buffers (attributes byte lives at +5)
     volatile const uint8_t* fc_ptrs[3] = {
         base + 5,
         base + fb_offset_for_index(triple_large,1) + 5,
         base + fb_offset_for_index(triple_large,2) + 5
     };
 
-    // Pixel base pointers (header_len bytes before first pixel)
+    // Pixel base pointer (header_len bytes before first pixel)
     auto pixel_base_for = [&](uint8_t idx)->volatile const uint8_t*{
         size_t off = fb_offset_for_index(triple_large, idx);
         return base + off + header_len;
     };
 
-    // Simple frame-change wait using summed counters across all active buffers
+    // Simple frame-change wait using summed counters across active buffers
     auto read_fc_sum = [&]()->uint8_t{
         uint8_t s=0;
         s += fc_ptrs[0][0];
-        if(is_triple) { s += fc_ptrs[1][0]; s += fc_ptrs[2][0]; }
+        if(is_triple) { s = (uint8_t)(s + fc_ptrs[1][0] + fc_ptrs[2][0]); }
         return s;
     };
 
+    // change detection state
     uint32_t last_hash = 0;
     bool first = true;
     uint64_t last_change_ns = now_ns();
-
-    fprintf(stdout,"time(s)  unchanged(s)  avg_rgb  center_rgb  %ux%u\n", width, height);
-    fflush(stdout);
+    double last_r = -1, last_g = -1, last_b = -1; // for tolerance gating
 
     // Helper lambdas to load a pixel at pointer p (format-specific)
     auto load_rgb24 = [](const volatile uint8_t* p, uint8_t& r, uint8_t& g, uint8_t& b){
         r = p[0]; g = p[1]; b = p[2];
     };
     auto load_rgba32 = [](const volatile uint8_t* p, uint8_t& r, uint8_t& g, uint8_t& b){
-        r = p[0]; g = p[1]; b = p[2]; /* p[3] alpha ignored */
+        r = p[0]; g = p[1]; b = p[2]; /* alpha ignored */
     };
     auto load_rgb565 = [](const volatile uint8_t* p, uint8_t& r, uint8_t& g, uint8_t& b){
         uint16_t v = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -201,8 +210,7 @@ int main(int argc, char** argv){
         }
         if(!g_run) break;
 
-        // sample sparse grid over whichever buffer is "current".
-        // We can just read buffer 0; counters change across all and header is updated first.
+        // sample sparse grid from buffer 0 (header updates first; good enough)
         const volatile uint8_t* pix0 = pixel_base_for(0);
 
         const int xs = (opts.step<1)?1:opts.step;
@@ -238,7 +246,7 @@ int main(int argc, char** argv){
                 }
             }
         } else {
-            fprintf(stderr,"Unsupported pixel format (%u)\n",(unsigned)fmt);
+            fprintf(stderr,"error=unsupported_format pixel_fmt=%u\n",(unsigned)fmt);
             break;
         }
 
@@ -263,26 +271,40 @@ int main(int argc, char** argv){
             Rc=r; Gc=g; Bc=b;
         }
 
-        // change detection by sample hash (cheap) + timer
+        // ----- change detection (fixed) -----
         uint64_t t_ns = now_ns();
-        if(first || hsh != last_hash){
+        if(first){
             last_hash = hsh;
+            last_change_ns = t_ns;
+            last_r = r_avg; last_g = g_avg; last_b = b_avg;
             first = false;
-            // reset last-change time on visual change
-            // (If you prefer using the header checksum alone, use frame_counter_from_attr)
-            // But the hash is robust against counters that don't strictly increment.
-            static_cast<void>(0);
-            // record now
-            // (we’ll subtract soon)
+        } else {
+            bool content_changed = (hsh != last_hash);
+            bool significant = content_changed;
+            if(opts.tolerance > 0.0){
+                double dr = std::fabs(r_avg - last_r);
+                double dg = std::fabs(g_avg - last_g);
+                double db = std::fabs(b_avg - last_b);
+                double l1 = dr + dg + db;        // L1 distance in 8-bit units
+                significant = content_changed && (l1 >= opts.tolerance);
+            }
+            if(significant){
+                last_change_ns = t_ns;
+                last_hash = hsh;
+                last_r = r_avg; last_g = g_avg; last_b = b_avg;
+            }
         }
-        static uint64_t last_change_mark = t_ns;
-        if(hsh != last_hash){ last_change_mark = t_ns; } // (kept above; here for clarity)
 
         double t_s = t_ns / 1e9;
-        double unchanged_s = (t_ns - last_change_mark) / 1e9;
+        double unchanged_s = (t_ns - last_change_ns) / 1e9;
 
-        printf("%.3f  %.3f  #%02X%02X%02X  #%02X%02X%02X\n",
-               t_s, unchanged_s, R,G,B, Rc,Gc,Bc);
+        // ----- tagged, single-line output -----
+        // time=   seconds since start
+        // unchanged= seconds since last significant change
+        // avg_rgb= sampled avg color; center_rgb= exact center pixel
+        // size= WxH; step= sampling grid; sleep_us= poll delay
+        printf("time=%.3f  unchanged=%.3f  avg_rgb=#%02X%02X%02X  center_rgb=#%02X%02X%02X  size=%ux%u  step=%d  sleep_us=%d\n",
+               t_s, unchanged_s, R,G,B, Rc,Gc,Bc, (unsigned)width,(unsigned)height, opts.step, opts.sleep_us);
         fflush(stdout);
 
         if(opts.sleep_us>0) usleep(opts.sleep_us);
