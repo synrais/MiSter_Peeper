@@ -1,4 +1,4 @@
-// mister_peeper.cpp — hash-timed unchanged, stable 100 Hz, linear avg, HSV color naming
+// mister_peeper.cpp — hash-timed unchanged, stable 100 Hz, linear avg, Lab(LCh) color naming
 // Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  color=Name
 
 #include <cstdint>
@@ -52,8 +52,7 @@ static inline uint64_t now_ns(){
 }
 static inline void sleep_until_ns(uint64_t t_ns){
     struct timespec ts{ (time_t)(t_ns/1000000000ull), (long)(t_ns%1000000000ull) };
-    // Use absolute-time sleep to avoid drift
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr); // absolute sleep = no drift
 }
 
 static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){
@@ -81,41 +80,57 @@ static inline uint8_t lin_to_srgb(double lin){
     int v=(int)llround(s*255.0); if(v<0) v=0; if(v>255) v=255; return (uint8_t)v;
 }
 
-// --------- HSV-based human-readable color naming ----------
-static inline const char* name_from_hsv(uint8_t R,uint8_t G,uint8_t B){
-    int maxv = std::max({(int)R,(int)G,(int)B});
-    int minv = std::min({(int)R,(int)G,(int)B});
-    int delta = maxv - minv;
+// --------- Linear sRGB -> XYZ(D65) -> Lab -> LCh naming ----------
+static inline void linrgb_to_xyz(double r,double g,double b,double& X,double& Y,double& Z){
+    // sRGB to XYZ (D65)
+    X = 0.4124564*r + 0.3575761*g + 0.1804375*b;
+    Y = 0.2126729*r + 0.7151522*g + 0.0721750*b;
+    Z = 0.0193339*r + 0.1191920*g + 0.9503041*b;
+}
+static inline double f_xyz(double t){
+    constexpr double eps = 216.0/24389.0;   // ~0.008856
+    constexpr double kap = 24389.0/27.0;    // ~903.3
+    return (t>eps) ? cbrt(t) : (kap*t + 16.0)/116.0;
+}
+static inline void xyz_to_lab(double X,double Y,double Z,double& L,double& a,double& b){
+    // D65 reference white (2°)
+    constexpr double Xn=0.95047, Yn=1.00000, Zn=1.08883;
+    double fx=f_xyz(X/Xn), fy=f_xyz(Y/Yn), fz=f_xyz(Z/Zn);
+    L = 116.0*fy - 16.0;
+    a = 500.0*(fx - fy);
+    b = 200.0*(fy - fz);
+}
+static inline void linrgb_to_lab(double r,double g,double b,double& L,double& a,double& B){
+    double X,Y,Z; linrgb_to_xyz(r,g,b,X,Y,Z); xyz_to_lab(X,Y,Z,L,a,B);
+}
 
-    double V = maxv / 255.0;
-    double S = (maxv == 0) ? 0.0 : (double)delta / (double)maxv;
-
-    // Brightness/saturation gates to avoid mislabeling vivid colors as "Black"
-    if (V < 0.08) return "Black";
-    if (S < 0.10) {
-        if (V > 0.92) return "White";
-        if (V > 0.55) return "Silver";
+// Human-readable color from Lab via LCh bins
+static inline const char* name_from_lch(double L,double a,double b){
+    // Grayscale detection via chroma; thresholds tuned for stability
+    double C = std::sqrt(a*a + b*b);
+    if (L < 10.0) return "Black";
+    if (C < 8.0) {
+        if (L > 90.0) return "White";
+        if (L > 65.0) return "Silver";
         return "Gray";
     }
 
-    double H = 0.0;
-    if (delta != 0) {
-        if (maxv == R)      H = 60.0 * fmod(((double)(G - B) / delta), 6.0);
-        else if (maxv == G) H = 60.0 * (((double)(B - R) / delta) + 2.0);
-        else                H = 60.0 * (((double)(R - G) / delta) + 4.0);
-        if (H < 0.0) H += 360.0;
-    }
+    // Hue angle in degrees [0,360)
+    double h = std::atan2(b, a) * (180.0/M_PI);
+    if (h < 0.0) h += 360.0;
 
-    if (H < 15 || H >= 345) return (V > 0.6 ? "Red" : "Dark Red");
-    if (H < 45)   return "Orange";
-    if (H < 65)   return "Yellow";
-    if (H < 90)   return "Chartreuse";
-    if (H < 150)  return "Green";
-    if (H < 200)  return "Cyan";
-    if (H < 230)  return "Turquoise";
-    if (H < 255)  return "Blue";
-    if (H < 285)  return "Violet";
-    if (H < 330)  return "Magenta";
+    // Hue sectors (wrap Red across 360/0)
+    // Red [345,360) U [0,20)
+    if (h >= 345.0 || h < 20.0) return (L < 35.0 ? "Dark Red" : "Red");
+    if (h < 45.0)   return "Orange";
+    if (h < 70.0)   return "Yellow";
+    if (h < 95.0)   return "Chartreuse";
+    if (h < 150.0)  return "Green";
+    if (h < 190.0)  return "Cyan";
+    if (h < 220.0)  return "Azure";
+    if (h < 255.0)  return "Blue";
+    if (h < 290.0)  return "Violet";
+    if (h < 330.0)  return "Magenta";
     return "Rose";
 }
 
@@ -159,11 +174,6 @@ int main(){
     };
 
     // Helpers
-    auto sum_fc=[&](){
-        uint16_t s = attr_ptrs[0][0];
-        if(triple){ s = (uint16_t)(s + attr_ptrs[1][0] + attr_ptrs[2][0]); }
-        return s;
-    };
     auto choose_active_idx = [&](const uint8_t prev[3], const uint8_t curr[3])->int{
         if(!triple) return 0;
         for(int i=0;i<3;i++) if(curr[i]!=prev[i]) return i; // the one that changed
@@ -200,10 +210,7 @@ int main(){
         sleep_until_ns(next_tick);
         if(!g_run) break;
 
-        // Touch frame counters once per tick
-        (void)sum_fc(); // optional read; we don't busy-wait
-
-        // Pick active buffer (which counter ticked)
+        // Read per-buffer counters once per tick
         uint8_t curr_fc[3] = {
             attr_ptrs[0][0],
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
@@ -216,7 +223,7 @@ int main(){
         const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + header_len;
 
         const int xs=kStep, ys=kStep;
-        uint64_t rlin=0, glin=0, blin=0, n=0;
+        uint64_t rlin_acc=0, glin_acc=0, blin_acc=0, n=0;
         uint32_t hsh=2166136261u;
 
         for(unsigned y=0;y<height;y+=ys){
@@ -226,21 +233,21 @@ int main(){
                 for(unsigned x=0;x<width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
-                    rlin += g_lut_lin[r]; glin += g_lut_lin[g]; blin += g_lut_lin[b];
+                    rlin_acc += g_lut_lin[r]; glin_acc += g_lut_lin[g]; blin_acc += g_lut_lin[b];
                     hsh=hash_rgb(hsh,r,g,b); n++;
                 }
             } else if(fmt==RGBA32){
                 for(unsigned x=0;x<width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
-                    rlin += g_lut_lin[r]; glin += g_lut_lin[g]; blin += g_lut_lin[b];
+                    rlin_acc += g_lut_lin[r]; glin_acc += g_lut_lin[g]; blin_acc += g_lut_lin[b];
                     hsh=hash_rgb(hsh,r,g,b); n++;
                 }
             } else { // RGB565
                 for(unsigned x=0;x<width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; load_rgb565(p,r,g,b);
-                    rlin += g_lut_lin[r]; glin += g_lut_lin[g]; blin += g_lut_lin[b];
+                    rlin_acc += g_lut_lin[r]; glin_acc += g_lut_lin[g]; blin_acc += g_lut_lin[b];
                     hsh=hash_rgb(hsh,r,g,b); n++;
                 }
             }
@@ -251,16 +258,20 @@ int main(){
         if(first){ last_hash=hsh; last_change_ns=t_ns; first=false; }
         else if(hsh!=last_hash){ last_hash=hsh; last_change_ns=t_ns; }
 
-        // Compute avg in linear, convert to sRGB
+        // Compute avg in linear
         double inv = n? 1.0/(double)n : 0.0;
-        double r_lin = (double)rlin * inv / (double)(1u<<20);
-        double g_lin = (double)glin * inv / (double)(1u<<20);
-        double b_lin = (double)blin * inv / (double)(1u<<20);
+        double r_lin = (double)rlin_acc * inv / (double)(1u<<20);
+        double g_lin = (double)glin_acc * inv / (double)(1u<<20);
+        double b_lin = (double)blin_acc * inv / (double)(1u<<20);
 
+        // Convert to sRGB for hex display
         uint8_t R = lin_to_srgb(r_lin);
         uint8_t G = lin_to_srgb(g_lin);
         uint8_t B = lin_to_srgb(b_lin);
-        const char* cname = name_from_hsv(R,G,B);
+
+        // Name from Lab/LCh
+        double L,a,b; linrgb_to_lab(r_lin, g_lin, b_lin, L, a, b);
+        const char* cname = name_from_lch(L,a,b);
 
         // Output
         double unchanged_s=(t_ns-last_change_ns)/1e9;
