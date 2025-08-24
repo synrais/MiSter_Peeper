@@ -1,4 +1,4 @@
-// mister_peeper.cpp — dominant color, fast like the old version
+// mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output
 // Prints: time=HH:MM:SS  unchanged=secs  dom_rgb=#RRGGBB (Name)
 
 #include <cstdint>
@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
+#include <unordered_map>
 #include <climits>
 
 static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
@@ -135,11 +136,6 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix, uint16_t w, 
     return cands[best_i].fn;
 }
 
-// ---- 5-6-5 histogram with epoch trick (fast, no clears) ----
-static uint32_t g_epoch = 1;                       // increments each frame
-static uint32_t g_stamp[65536];                    // last-touched epoch per bin
-static uint16_t g_count[65536];                    // count per bin for current epoch
-
 int main(){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
 
@@ -209,9 +205,9 @@ int main(){
     Rgb16Loader rgb16_loader = nullptr;
 
     while(g_run){
-        // Wait for next frame (match old low-wake behavior)
+        // Wait for next frame (≈ refresh rate). Polled gently.
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(10000); // ~100 Hz
+        while(g_run && sum_fc()==s0) usleep(1000);
         if(!g_run) break;
 
         // Pick active buffer (the one that ticked)
@@ -229,12 +225,9 @@ int main(){
         const int xs=kStep, ys=kStep;
         uint32_t hsh=2166136261u;
 
-        // epoch for this frame
-        uint32_t const epoch = ++g_epoch; // wrap is fine due to equality check
-
-        // track mode on the fly (no end-of-frame sweep)
-        uint32_t mode_key = 0;
-        uint16_t mode_count = 0;
+        // Dominant color counting (over sampled grid)
+        std::unordered_map<uint32_t,uint32_t> hist;
+        hist.reserve(1u<<16);
 
         if(fmt==RGB24){
             for(unsigned y=0;y<height;y+=ys){
@@ -243,17 +236,7 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-
-                    // quantize to 5-6-5
-                    uint32_t r5 = (uint32_t)(r >> 3);
-                    uint32_t g6 = (uint32_t)(g >> 2);
-                    uint32_t b5 = (uint32_t)(b >> 3);
-                    uint32_t key = (r5<<11) | (g6<<5) | b5;
-
-                    if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
-                    else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
-                    // ensure first-touch can become mode too
-                    if(mode_count==0){ mode_count=1; mode_key=key; }
+                    ++hist[((uint32_t)r<<16)|((uint32_t)g<<8)|b];
                 }
             }
         } else if(fmt==RGBA32){
@@ -263,18 +246,10 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-
-                    uint32_t r5 = (uint32_t)(r >> 3);
-                    uint32_t g6 = (uint32_t)(g >> 2);
-                    uint32_t b5 = (uint32_t)(b >> 3);
-                    uint32_t key = (r5<<11) | (g6<<5) | b5;
-
-                    if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
-                    else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
-                    if(mode_count==0){ mode_count=1; mode_key=key; }
+                    ++hist[((uint32_t)r<<16)|((uint32_t)g<<8)|b];
                 }
             }
-        } else { // RGB16 family (auto-detect once)
+        } else { // RGB16 family (auto-detect)
             if(!rgb16_loader){
                 rgb16_loader = choose_rgb16_loader(pix, width, height, line);
             }
@@ -284,29 +259,26 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; rgb16_loader(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-
-                    uint32_t r5 = (uint32_t)(r >> 3);
-                    uint32_t g6 = (uint32_t)(g >> 2);
-                    uint32_t b5 = (uint32_t)(b >> 3);
-                    uint32_t key = (r5<<11) | (g6<<5) | b5;
-
-                    if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
-                    else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
-                    if(mode_count==0){ mode_count=1; mode_key=key; }
+                    ++hist[((uint32_t)r<<16)|((uint32_t)g<<8)|b];
                 }
             }
         }
 
         // Change detection: HASH ONLY
         uint64_t t_ns=now_ns();
-        static uint64_t last_change_ns=start_ns;
         if(first){ last_hash=hsh; last_change_ns=t_ns; first=false; }
         else if(hsh!=last_hash){ last_change_ns=t_ns; last_hash=hsh; }
 
-        // Expand 5-6-5 mode bin back to 8-bit RGB for output
-        uint8_t Rd = (uint8_t)(((mode_key >> 11) & 0x1F) * 255 / 31);
-        uint8_t Gd = (uint8_t)(((mode_key >> 5 ) & 0x3F) * 255 / 63);
-        uint8_t Bd = (uint8_t)((  mode_key        & 0x1F) * 255 / 31);
+        // Dominant color (mode of sampled colors)
+        uint32_t dom_key = 0, dom_count = 0;
+        for(const auto& kv : hist){
+            if(kv.second > dom_count || (kv.second==dom_count && kv.first < dom_key)){
+                dom_key = kv.first; dom_count = kv.second;
+            }
+        }
+        uint8_t Rd = (uint8_t)((dom_key>>16)&0xFF);
+        uint8_t Gd = (uint8_t)((dom_key>>8 )&0xFF);
+        uint8_t Bd = (uint8_t)( dom_key      &0xFF);
 
         // Output
         double unchanged_s=(t_ns-last_change_ns)/1e9;
@@ -315,8 +287,9 @@ int main(){
 
         const char* dom_name = nearest_color_name(Rd,Gd,Bd);
 
-        printf("time=%s  unchanged=%.3f  dom_rgb=#%02X%02%02X (%s)\n",
-               tbuf, unchanged_s, Rd, Gd, Bd, dom_name);
+        printf("time=%s  unchanged=%.3f  dom_rgb=#%02X%02X%02X (%s)\n",
+               tbuf, unchanged_s,
+               Rd,Gd,Bd, dom_name);
         fflush(stdout);
     }
 
