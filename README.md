@@ -1,4 +1,4 @@
-# mister_peeper
+# MiSTer_Peeper
 
 Minimal per-frame sampler for the MiSTer scaler output.  
 It reads the scaler header directly from `/dev/mem`, lightly polls for new frames, hashes each sampled frame to detect changes, and reports the dominant on-screen color using a fast RGB565 histogram over a sparse grid.
