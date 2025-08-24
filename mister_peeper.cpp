@@ -220,7 +220,7 @@ int main(){
         unsigned B=(unsigned)(n? (double)bs/n : 0.0);
         const char* cname = name_for_rgb(R,G,B);
 
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s\n",
+        printf("time=%s  frame_unchanged=%.3f  avg_rgb=#%02X%02X%02X  avg_color=%s\n",
                tbuf, unchanged_s, R,G,B, cname);
         fflush(stdout);
     }
