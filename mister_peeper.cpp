@@ -14,12 +14,15 @@
 #include <time.h>
 #include <climits>
 
-static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
-static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;
-static constexpr size_t MAP_LEN         = 2048u * 1024u * 12u; // ~24 MiB
+// ---------- Tunables ----------
+static constexpr int    kStep            = 16;                 // sampling grid step
+static constexpr size_t FB_BASE_ADDRESS  = 0x20000000u;        // MiSTer scaler
+static constexpr size_t MAP_LEN          = 2048u * 1024u * 12u;// ~24 MiB
+static int              g_poll_ms        = 10;                 // ~100 Hz default
 
 enum ScalerPixelFormat : uint8_t { RGB16 = 0, RGB24 = 1, RGBA32 = 2 };
 
+// ---------- Scaler header ----------
 #pragma pack(push,1)
 struct FbHeader {
     uint8_t  ty;                // 0x01
@@ -28,7 +31,7 @@ struct FbHeader {
     uint16_t attributes_be;     // bit4 triple; bits7..5 frame counter
     uint16_t width_be;
     uint16_t height_be;
-    uint16_t line_be;           // stride
+    uint16_t line_be;           // stride in bytes
     uint16_t out_width_be;
     uint16_t out_height_be;
 };
@@ -42,6 +45,7 @@ static inline size_t fb_off(bool large, uint8_t idx){
                  : (idx==1 ? 0x00200000u : 0x00400000u);
 }
 
+// ---------- Runtime ----------
 static volatile bool g_run=true;
 static void on_sig(int){ g_run=false; }
 
@@ -58,7 +62,7 @@ static inline void fmt_hms(double s,char* out,size_t n){
     snprintf(out,n,"%02d:%02d:%02d",H,M,S);
 }
 
-// ---- Simple nearest-name color mapping for human readability ----
+// ---------- Nearest color name ----------
 struct NamedColor { const char* name; uint8_t r,g,b; };
 static constexpr NamedColor kPalette[] = {
     {"Black",0,0,0},{"White",255,255,255},{"Red",255,0,0},{"Lime",0,255,0},
@@ -80,7 +84,7 @@ static inline const char* nearest_color_name(uint8_t r,uint8_t g,uint8_t b){
     return kPalette[best_i].name;
 }
 
-// ---- 16-bit pixel loaders (all variants) ----
+// ---------- 16-bit pixel loaders ----------
 static inline void load_rgb565_LE(const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){
     uint16_t v=(uint16_t)p[0]|((uint16_t)p[1]<<8);
     r=(uint8_t)(((v>>11)&0x1F)*255/31);
@@ -106,41 +110,136 @@ static inline void load_bgr565_BE(const volatile uint8_t*p,uint8_t&r,uint8_t&g,u
     r=(uint8_t)(( v      &0x1F)*255/31);
 }
 
-// Choose best 16-bit loader by probing one frame (prefers most "colorful")
 using Rgb16Loader = void (*)(const volatile uint8_t*,uint8_t&,uint8_t&,uint8_t&);
-static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix, uint16_t w, uint16_t h, uint16_t line){
-    struct Cand { const char* name; Rgb16Loader fn; } cands[] = {
+
+// ---------- CLI override ----------
+static Rgb16Loader g_forced_loader = nullptr;
+
+static void parse_flags(int argc,char**argv){
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"--rgb565-le")) g_forced_loader = load_rgb565_LE;
+        else if(!strcmp(argv[i],"--rgb565-be")) g_forced_loader = load_rgb565_BE;
+        else if(!strcmp(argv[i],"--bgr565-le")) g_forced_loader = load_bgr565_LE;
+        else if(!strcmp(argv[i],"--bgr565-be")) g_forced_loader = load_bgr565_BE;
+        else if(!strncmp(argv[i],"--poll=",7)){
+            int v = atoi(argv[i]+7);
+            if(v>=0 && v<=1000) g_poll_ms = v;
+        }
+    }
+}
+
+// ---------- robust 16-bit autodetect ----------
+struct Stats { double mean[3]; double m2[3]; uint8_t minv[3]; uint8_t maxv[3]; uint64_t n; };
+
+static inline void stats_init(Stats&s){
+    s.mean[0]=s.mean[1]=s.mean[2]=0.0;
+    s.m2[0]=s.m2[1]=s.m2[2]=0.0;
+    s.minv[0]=s.minv[1]=s.minv[2]=255;
+    s.maxv[0]=s.maxv[1]=s.maxv[2]=0;
+    s.n=0;
+}
+static inline void stats_push(Stats&s,uint8_t r,uint8_t g,uint8_t b){
+    uint8_t v[3]={r,g,b};
+    s.n++;
+    for(int i=0;i<3;i++){
+        double x=v[i];
+        double d=x - s.mean[i];
+        s.mean[i] += d / (double)s.n;
+        s.m2[i]   += d * (x - s.mean[i]);
+        if(v[i]<s.minv[i]) s.minv[i]=v[i];
+        if(v[i]>s.maxv[i]) s.maxv[i]=v[i];
+    }
+}
+static inline double stats_var(const Stats&s,int i){
+    return (s.n>1) ? (s.m2[i]/(double)(s.n-1)) : 0.0;
+}
+
+// Try all four loaders on a sparse multi-offset sample **within one frame**.
+// Score by color variance + span sanity; pick best. If everything is too flat,
+// keep sampling more points via additional offsets for robustness.
+static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
+                                       uint16_t w, uint16_t h, uint16_t line){
+    struct Cand { const char* name; Rgb16Loader fn; } C[4] = {
         {"RGB565-LE", load_rgb565_LE}, {"RGB565-BE", load_rgb565_BE},
         {"BGR565-LE", load_bgr565_LE}, {"BGR565-BE", load_bgr565_BE}
     };
-    double best_score = -1.0;
-    int best_i = 0;
-    for(int i=0;i<4;i++){
-        uint64_t rs=0,gs=0,bs=0; uint64_t n=0;
-        for(unsigned y=0;y<h;y+=32){
-            const volatile uint8_t* row=pix + (size_t)y*line;
-            for(unsigned x=0;x<w;x+=32){
-                const volatile uint8_t* p=row + (size_t)x*2;
-                uint8_t r,g,b; cands[i].fn(p,r,g,b);
-                rs+=r; gs+=g; bs+=b; n++;
+    const int off_table[][2] = { {0,0},{8,8},{4,12},{12,4},{2,2},{6,10},{10,6} };
+    const int off_count = (int)(sizeof(off_table)/sizeof(off_table[0]));
+
+    Stats S[4]; for(int i=0;i<4;i++) stats_init(S[i]);
+
+    // sample up to a few hundred points per candidate
+    int samples = 0;
+    for(int oi=0; oi<off_count; ++oi){
+        int ox=off_table[oi][0], oy=off_table[oi][1];
+        for(unsigned y=oy; y<h; y+=32){
+            const volatile uint8_t* row = pix + (size_t)y*line;
+            for(unsigned x=ox; x<w; x+=32){
+                const volatile uint8_t* p = row + (size_t)x*2;
+                uint8_t r,g,b;
+                for(int i=0;i<4;i++){
+                    C[i].fn(p,r,g,b);
+                    stats_push(S[i],r,g,b);
+                }
+                if(++samples>1200) break;
             }
+            if(samples>1200) break;
         }
-        if(n==0) continue;
-        double R=(double)rs/n, G=(double)gs/n, B=(double)bs/n;
-        double dRG=R-G, dGB=G-B, dBR=B-R;
-        double score = dRG*dRG + dGB*dGB + dBR*dBR;
-        if(score>best_score){ best_score=score; best_i=i; }
+        // after each offset, see if variance is sufficient to decide
+        auto score=[&](const Stats& st){
+            double vr=stats_var(st,0), vg=stats_var(st,1), vb=stats_var(st,2);
+            double colorfulness = (vr-vg)*(vr-vg) + (vg-vb)*(vg-vb) + (vb-vr)*(vb-vr);
+            double spanR = (double)(st.maxv[0]-st.minv[0]);
+            double spanG = (double)(st.maxv[1]-st.minv[1]);
+            double spanB = (double)(st.maxv[2]-st.minv[2]);
+            double flat_penalty = 0.0;
+            if(spanR<2) flat_penalty += 1.0;
+            if(spanG<2) flat_penalty += 1.0;
+            if(spanB<2) flat_penalty += 1.0;
+            // encourage green span (6 bits) to not be the smallest
+            double shape_penalty = (spanG+1.0 < 0.8*(std::max(spanR,spanB)+1.0)) ? 0.5 : 0.0;
+            return colorfulness - (1e6*flat_penalty + 1e5*shape_penalty);
+        };
+        // decide if there is a clear winner
+        double best=-1e300, second=-1e300; int bi=0;
+        for(int i=0;i<4;i++){
+            double sc=score(S[i]);
+            if(sc>best){ second=best; best=sc; bi=i; }
+            else if(sc>second){ second=sc; }
+        }
+        // lock if we have enough samples and a decent margin
+        if(S[bi].n>64 && (best > second*1.2 + 1e5)){ // margin heuristic
+            fprintf(stderr,"info=rgb16_loader variant=%s samples=%llu\n", C[bi].name, (unsigned long long)S[bi].n);
+            return C[bi].fn;
+        }
     }
-    fprintf(stderr,"info=rgb16_loader variant=%s\n", cands[best_i].name);
-    return cands[best_i].fn;
+    // fallback: just pick best after all samples
+    double best=-1e300; int bi=0;
+    auto final_score=[&](const Stats& st){
+        double vr=stats_var(st,0), vg=stats_var(st,1), vb=stats_var(st,2);
+        double colorfulness = (vr-vg)*(vr-vg) + (vg-vb)*(vg-vb) + (vb-vr)*(vb-vr);
+        double spanR = (double)(st.maxv[0]-st.minv[0]);
+        double spanG = (double)(st.maxv[1]-st.minv[1]);
+        double spanB = (double)(st.maxv[2]-st.minv[2]);
+        double flat_penalty = (spanR<2) + (spanG<2) + (spanB<2);
+        return colorfulness - 1e6*flat_penalty;
+    };
+    for(int i=0;i<4;i++){
+        double sc=final_score(S[i]);
+        if(sc>best){ best=sc; bi=i; }
+    }
+    fprintf(stderr,"info=rgb16_loader variant=%s samples=%llu (fallback)\n", C[bi].name, (unsigned long long)S[bi].n);
+    return C[bi].fn;
 }
 
-// ---- 5-6-5 histogram with epoch trick (fast, no clears) ----
+// ---------- 5-6-5 histogram with epoch trick ----------
 static uint32_t g_epoch = 1;
 static uint32_t g_stamp[65536];
 static uint16_t g_count[65536];
 
-int main(){
+int main(int argc,char**argv){
+    parse_flags(argc, argv);
+
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
 
     // Map scaler
@@ -194,7 +293,7 @@ int main(){
     auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
 
-    // Change detection state
+    // Hash-only change detection state
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
 
@@ -205,16 +304,18 @@ int main(){
         static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
     };
 
-    // Cached RGB16 loader (auto-detected on first use)
-    Rgb16Loader rgb16_loader = nullptr;
+    // Cached RGB16 loader (auto-detected on first use or CLI forced)
+    Rgb16Loader rgb16_loader = g_forced_loader;
 
     while(g_run){
-        // Wait for next frame (low wake like the old version)
+        // Wait for next frame (low wake)
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(10000); // ~100 Hz
+        while(g_run && sum_fc()==s0){
+            if(g_poll_ms>0) usleep((useconds_t)(g_poll_ms*1000));
+        }
         if(!g_run) break;
 
-        // Pick active buffer
+        // Pick active buffer (the one that ticked)
         uint8_t curr_fc[3] = {
             attr_ptrs[0][0],
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
@@ -223,7 +324,7 @@ int main(){
         int buf = choose_active_idx(prev_fc, curr_fc);
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
-        // Sample once (no retries)
+        // Sample that buffer once (no retries)
         const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + header_len;
 
         const int xs=kStep, ys=kStep;
@@ -243,13 +344,8 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-
                     // quantize to 5-6-5
-                    uint32_t r5 = (uint32_t)(r >> 3);
-                    uint32_t g6 = (uint32_t)(g >> 2);
-                    uint32_t b5 = (uint32_t)(b >> 3);
-                    uint32_t key = (r5<<11) | (g6<<5) | b5;
-
+                    uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
                     else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
                     if(mode_count==0){ mode_count=1; mode_key=key; }
@@ -262,18 +358,13 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-
-                    uint32_t r5 = (uint32_t)(r >> 3);
-                    uint32_t g6 = (uint32_t)(g >> 2);
-                    uint32_t b5 = (uint32_t)(b >> 3);
-                    uint32_t key = (r5<<11) | (g6<<5) | b5;
-
+                    uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
                     else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
                     if(mode_count==0){ mode_count=1; mode_key=key; }
                 }
             }
-        } else { // RGB16 family (auto-detect once)
+        } else { // RGB16 family
             if(!rgb16_loader){
                 rgb16_loader = choose_rgb16_loader(pix, width, height, line);
             }
@@ -283,12 +374,7 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; rgb16_loader(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-
-                    uint32_t r5 = (uint32_t)(r >> 3);
-                    uint32_t g6 = (uint32_t)(g >> 2);
-                    uint32_t b5 = (uint32_t)(b >> 3);
-                    uint32_t key = (r5<<11) | (g6<<5) | b5;
-
+                    uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
                     else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
                     if(mode_count==0){ mode_count=1; mode_key=key; }
@@ -306,11 +392,10 @@ int main(){
         uint8_t Gd = (uint8_t)(((mode_key >> 5 ) & 0x3F) * 255 / 63);
         uint8_t Bd = (uint8_t)((  mode_key        & 0x1F) * 255 / 31);
 
-        // Output (exact flow you asked for)
+        // Output
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
-
         const char* dom_name = nearest_color_name(Rd,Gd,Bd);
 
         printf("time=%s  unchanged=%.3f  dom_rgb=#%02X%02X%02X (%s)\n",
