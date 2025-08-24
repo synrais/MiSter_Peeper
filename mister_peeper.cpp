@@ -1,6 +1,5 @@
 // mister_peeper.cpp — per-frame, buffer-aware, hash-based unchanged timer, minimal output
 // Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  color=Name
-// Set SHOW_HASH 1 to also print hash and buffer index for verification.
 
 #include <cstdint>
 #include <cstdio>
@@ -14,9 +13,8 @@
 #include <unistd.h>
 #include <time.h>
 
-#define SHOW_HASH 0  // set to 1 for debug: shows hsh=0x???????? buf=N
-
 static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
+// kTolerance removed: unchanged is now driven purely by the hash
 static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;
 static constexpr size_t MAP_LEN         = 2048u * 1024u * 12u; // ~24 MiB
 
@@ -52,7 +50,6 @@ static inline uint64_t now_ns(){
     return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec;
 }
 static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){
-    // Same rolling mixer as your “accurate” version
     h^=((uint32_t)r<<16)^((uint32_t)g<<8)^(uint32_t)b;
     h^=h<<13; h^=h>>17; h^=h<<5; return h;
 }
@@ -61,7 +58,7 @@ static inline void fmt_hms(double s,char* out,size_t n){
     snprintf(out,n,"%02d:%02d:%02d",H,M,S);
 }
 
-// Small nearest-color palette (cheap & stable)
+// Simple nearest-named-color mapper (RGB Euclidean)
 struct NamedColor { const char* name; uint8_t r,g,b; };
 static const NamedColor kNamed[] = {
     {"Black",0,0,0}, {"White",255,255,255}, {"Silver",192,192,192}, {"Gray",128,128,128},
@@ -131,7 +128,7 @@ int main(){
         int idx=0; if(curr[1]>=curr[idx]) idx=1; if(curr[2]>=curr[idx]) idx=2; return idx; // fallback
     };
 
-    // Pixel loaders (RGB order; if your source were BGR, swap here)
+    // Pixel loaders
     auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgb565=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){
@@ -141,11 +138,11 @@ int main(){
         b=(uint8_t)(( v     &0x1F)*255/31);
     };
 
-    // Change detection state (hash-only)
+    // Change detection state
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
 
-    // Previous per-buffer counters
+    // Previous per-buffer counters (casts silence narrowing warnings)
     uint8_t prev_fc[3] = {
         attr_ptrs[0][0],
         static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
@@ -155,7 +152,8 @@ int main(){
     while(g_run){
         // Wait for next frame; poll gently at ~100 Hz (10 ms)
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(10000);
+        while(g_run && sum_fc()==s0) usleep(10000); // 100 Hz lock
+
         if(!g_run) break;
 
         // Pick active buffer (the one that ticked)
@@ -172,7 +170,7 @@ int main(){
 
         const int xs=kStep, ys=kStep;
         uint64_t rs=0,gs=0,bs=0,n=0;
-        uint32_t hsh=2166136261u; // seed
+        uint32_t hsh=2166136261u;
 
         if(fmt==RGB24){
             for(unsigned y=0;y<height;y+=ys){
@@ -203,7 +201,7 @@ int main(){
             }
         }
 
-        // Change detection (hash-only)
+        // Change detection: hash only
         uint64_t t_ns=now_ns();
         if(first){
             last_hash=hsh; last_change_ns=t_ns; first=false;
@@ -212,22 +210,18 @@ int main(){
             last_change_ns=t_ns;
         }
 
-        // Averages and output
-        unsigned R=(unsigned)(n? (double)rs/n : 0.0);
-        unsigned G=(unsigned)(n? (double)gs/n : 0.0);
-        unsigned B=(unsigned)(n? (double)bs/n : 0.0);
-
+        // Averages and presentation
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
 
-    #if SHOW_HASH
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s  hsh=0x%08X  buf=%d\n",
-               tbuf, unchanged_s, R,G,B, name_for_rgb(R,G,B), hsh, buf);
-    #else
+        unsigned R=(unsigned)(n? (double)rs/n : 0.0);
+        unsigned G=(unsigned)(n? (double)gs/n : 0.0);
+        unsigned B=(unsigned)(n? (double)bs/n : 0.0);
+        const char* cname = name_for_rgb(R,G,B);
+
         printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s\n",
-               tbuf, unchanged_s, R,G,B, name_for_rgb(R,G,B));
-    #endif
+               tbuf, unchanged_s, R,G,B, cname);
         fflush(stdout);
     }
 
