@@ -1,5 +1,25 @@
-// mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output
-// Prints: time=HH:MM:SS  unchanged=secs  dom_rgb=#RRGGBB (Name)
+// mister_peeper.cpp
+//
+// Minimal per-frame sampler for MiSTer scaler output.
+// - Reads the scaler header from 0x20000000 (ASCAL) via /dev/mem
+// - Tracks an "unchanged" timer using a frame hash (no retries, no tolerance)
+// - Reports the dominant color over a sparse grid (fast 5-6-5 histogram)
+// - Auto-detects 16-bit RGB565 ordering (RGB/BGR, LE/BE) and re-detects on core/geometry change
+// - Low CPU usage via gentle polling
+//
+// Console output (stdout, one line per frame):
+//   time=HH:MM:SS  unchanged=secs  dom_rgb=#RRGGBB (Name)
+//
+// Build (example):
+//   g++ -O3 -march=native -fno-exceptions -fno-rtti -Wall -Wextra -o mister_peeper mister_peeper.cpp
+//
+// Run:
+//   sudo ./mister_peeper
+//
+// Notes:
+// - 24/32-bit paths assume RGB byte order as exposed by the scaler.
+// - 16-bit paths auto-detect the correct loader once per geometry change.
+// - One-line info messages (chosen 565 variant, scaler changes) are printed to stderr.
 
 #include <cstdint>
 #include <cstdio>
@@ -7,18 +27,18 @@
 #include <cstring>
 #include <cerrno>
 #include <csignal>
-#include <cmath>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
 #include <climits>
+#include <algorithm> // for std::max
 
 // ---------- Tunables ----------
-static constexpr int    kStep            = 16;                 // sampling grid step
-static constexpr size_t FB_BASE_ADDRESS  = 0x20000000u;        // MiSTer scaler
-static constexpr size_t MAP_LEN          = 2048u * 1024u * 12u;// ~24 MiB
-static int              g_poll_ms        = 10;                 // ~100 Hz default
+static constexpr int    kStep            = 16;                 // sampling grid step (pixels)
+static constexpr size_t FB_BASE_ADDRESS  = 0x20000000u;        // MiSTer scaler base (ASCAL)
+static constexpr size_t MAP_LEN          = 2048u * 1024u * 12u;// ~24 MiB mapping window
+static constexpr int    kPollMs          = 10;                 // ~100 Hz idle polling
 
 enum ScalerPixelFormat : uint8_t { RGB16 = 0, RGB24 = 1, RGBA32 = 2 };
 
@@ -62,7 +82,7 @@ static inline void fmt_hms(double s,char* out,size_t n){
     snprintf(out,n,"%02d:%02d:%02d",H,M,S);
 }
 
-// ---------- Nearest color name ----------
+// ---------- Nearest color name (tiny palette for readability) ----------
 struct NamedColor { const char* name; uint8_t r,g,b; };
 static constexpr NamedColor kPalette[] = {
     {"Black",0,0,0},{"White",255,255,255},{"Red",255,0,0},{"Lime",0,255,0},
@@ -112,25 +132,8 @@ static inline void load_bgr565_BE(const volatile uint8_t*p,uint8_t&r,uint8_t&g,u
 
 using Rgb16Loader = void (*)(const volatile uint8_t*,uint8_t&,uint8_t&,uint8_t&);
 
-// ---------- CLI override ----------
-static Rgb16Loader g_forced_loader = nullptr;
-
-static void parse_flags(int argc,char**argv){
-    for(int i=1;i<argc;i++){
-        if(!strcmp(argv[i],"--rgb565-le")) g_forced_loader = load_rgb565_LE;
-        else if(!strcmp(argv[i],"--rgb565-be")) g_forced_loader = load_rgb565_BE;
-        else if(!strcmp(argv[i],"--bgr565-le")) g_forced_loader = load_bgr565_LE;
-        else if(!strcmp(argv[i],"--bgr565-be")) g_forced_loader = load_bgr565_BE;
-        else if(!strncmp(argv[i],"--poll=",7)){
-            int v = atoi(argv[i]+7);
-            if(v>=0 && v<=1000) g_poll_ms = v;
-        }
-    }
-}
-
-// ---------- robust 16-bit autodetect ----------
+// ---------- robust 16-bit autodetect (single-frame, multi-offset, variance-based) ----------
 struct Stats { double mean[3]; double m2[3]; uint8_t minv[3]; uint8_t maxv[3]; uint64_t n; };
-
 static inline void stats_init(Stats&s){
     s.mean[0]=s.mean[1]=s.mean[2]=0.0;
     s.m2[0]=s.m2[1]=s.m2[2]=0.0;
@@ -154,7 +157,6 @@ static inline double stats_var(const Stats&s,int i){
     return (s.n>1) ? (s.m2[i]/(double)(s.n-1)) : 0.0;
 }
 
-// Try all four loaders on a sparse multi-offset sample within one frame.
 static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
                                        uint16_t w, uint16_t h, uint16_t line){
     struct Cand { const char* name; Rgb16Loader fn; } C[4] = {
@@ -165,8 +167,8 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
     const int off_count = (int)(sizeof(off_table)/sizeof(off_table[0]));
 
     Stats S[4]; for(int i=0;i<4;i++) stats_init(S[i]);
-
     int samples = 0;
+
     for(int oi=0; oi<off_count; ++oi){
         int ox=off_table[oi][0], oy=off_table[oi][1];
         for(unsigned y=oy; y<h; y+=32){
@@ -174,14 +176,12 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
             for(unsigned x=ox; x<w; x+=32){
                 const volatile uint8_t* p = row + (size_t)x*2;
                 uint8_t r,g,b;
-                for(int i=0;i<4;i++){
-                    C[i].fn(p,r,g,b);
-                    stats_push(S[i],r,g,b);
-                }
+                for(int i=0;i<4;i++){ C[i].fn(p,r,g,b); stats_push(S[i],r,g,b); }
                 if(++samples>1200) break;
             }
             if(samples>1200) break;
         }
+        // scoring with variance + span sanity
         auto score=[&](const Stats& st){
             double vr=stats_var(st,0), vg=stats_var(st,1), vb=stats_var(st,2);
             double colorfulness = (vr-vg)*(vr-vg) + (vg-vb)*(vg-vb) + (vb-vr)*(vb-vr);
@@ -206,6 +206,7 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
             return C[bi].fn;
         }
     }
+    // fallback pick
     double best=-1e300; int bi=0;
     auto final_score=[&](const Stats& st){
         double vr=stats_var(st,0), vg=stats_var(st,1), vb=stats_var(st,2);
@@ -216,10 +217,7 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
         double flat_penalty = (spanR<2) + (spanG<2) + (spanB<2);
         return colorfulness - 1e6*flat_penalty;
     };
-    for(int i=0;i<4;i++){
-        double sc=final_score(S[i]);
-        if(sc>best){ best=sc; bi=i; }
-    }
+    for(int i=0;i<4;i++){ double sc=final_score(S[i]); if(sc>best){ best=sc; bi=i; } }
     fprintf(stderr,"info=rgb16_loader variant=%s samples=%llu (fallback)\n", C[bi].name, (unsigned long long)S[bi].n);
     return C[bi].fn;
 }
@@ -229,9 +227,7 @@ static uint32_t g_epoch = 1;
 static uint32_t g_stamp[65536];
 static uint16_t g_count[65536];
 
-int main(int argc,char**argv){
-    parse_flags(argc, argv);
-
+int main(){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
 
     // Map scaler
@@ -291,8 +287,8 @@ int main(int argc,char**argv){
         static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
     };
 
-    // Cached RGB16 loader (auto-detected on first use or CLI forced)
-    Rgb16Loader rgb16_loader = g_forced_loader;
+    // RGB16 loader (auto-detected on first applicable frame; re-detected on scaler change)
+    Rgb16Loader rgb16_loader = nullptr;
 
     while(g_run){
         // Wait for next frame (low wake)
@@ -300,7 +296,7 @@ int main(int argc,char**argv){
         while(g_run){
             uint16_t s1 = attr_ptrs[0][0] + (triple ? (uint16_t)(attr_ptrs[1][0]+attr_ptrs[2][0]) : 0);
             if(s1!=s0) break;
-            if(g_poll_ms>0) usleep((useconds_t)(g_poll_ms*1000));
+            usleep((useconds_t)(kPollMs*1000));
         }
         if(!g_run) break;
 
@@ -314,7 +310,7 @@ int main(int argc,char**argv){
         ScalerPixelFormat cur_fmt = (ScalerPixelFormat)cur_fmt_u8;
         bool     cur_triple    = triple_buffered(hc.attributes_be);
 
-        // If geometry or format changed: update and reset loader for 16-bit
+        // If geometry/format changed: update and reset 16-bit loader
         if(cur_width!=last_width || cur_height!=last_height ||
            cur_line!=last_line || cur_fmt_u8!=last_fmt ||
            cur_header_len!=last_header_len || cur_triple!=triple)
@@ -325,10 +321,10 @@ int main(int argc,char**argv){
             // Recompute triple buffer size flag
             large = triple && !hdr_ok(0x00200000u) && hdr_ok(0x00800000u);
 
-            // Reset rgb16 autodetect unless forced by CLI
-            rgb16_loader = g_forced_loader;
+            // Reset rgb16 autodetect
+            rgb16_loader = nullptr;
 
-            // Also reset change timer baseline to avoid weird unchanged times across modes
+            // Reset change baseline to avoid crossing timers across modes
             last_hash = 0; first = true;
             fprintf(stderr,"info=scaler_changed w=%u h=%u line=%u fmt=%u triple=%u\n",
                     (unsigned)cur_width,(unsigned)cur_height,(unsigned)cur_line,
@@ -341,21 +337,25 @@ int main(int argc,char**argv){
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
             static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
         };
-        int idx=0; if(triple){ for(int i=0;i<3;i++) if(curr_fc[i]!=prev_fc[i]) { idx=i; break; }
-                               if(curr_fc[1]>=curr_fc[idx]) idx=1; if(curr_fc[2]>=curr_fc[idx]) idx=2; }
+        int idx=0;
+        if(triple){
+            for(int i=0;i<3;i++) if(curr_fc[i]!=prev_fc[i]) { idx=i; break; }
+            if(curr_fc[1]>=curr_fc[idx]) idx=1;
+            if(curr_fc[2]>=curr_fc[idx]) idx=2;
+        }
         int buf = idx;
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
-        // Sample that buffer once (no retries)
+        // Address of active frame pixels
         const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + last_header_len;
 
         const int xs=kStep, ys=kStep;
         uint32_t hsh=2166136261u;
 
-        // epoch for this frame
-        uint32_t const epoch = ++g_epoch; // wrap ok
+        // Epoch for this frame (avoid clearing 64k histogram)
+        uint32_t const epoch = ++g_epoch; // wrap ok (equality check)
 
-        // on-the-fly mode tracking
+        // On-the-fly mode tracking (dominant bin)
         uint32_t mode_key = 0;
         uint16_t mode_count = 0;
 
@@ -364,7 +364,8 @@ int main(int argc,char**argv){
                 const volatile uint8_t* row=pix + (size_t)y*last_line;
                 for(unsigned x=0;x<last_width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*3;
-                    uint8_t r,g,b; load_rgb24(p,r,g,b);
+                    uint8_t r=g_stamp[0], g=g_stamp[0], b=g_stamp[0]; // init suppresses warnings; overwritten below
+                    r=p[0]; g=p[1]; b=p[2];
                     hsh=hash_rgb(hsh,r,g,b);
                     uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
@@ -377,7 +378,7 @@ int main(int argc,char**argv){
                 const volatile uint8_t* row=pix + (size_t)y*last_line;
                 for(unsigned x=0;x<last_width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*4;
-                    uint8_t r,g,b; load_rgba32(p,r,g,b);
+                    uint8_t r=p[0], g=p[1], b=p[2];
                     hsh=hash_rgb(hsh,r,g,b);
                     uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
