@@ -35,7 +35,7 @@
 #include <algorithm> // for std::max
 
 // ---------- Tunables ----------
-static constexpr int    kStep            = 4;                 // sampling grid step (pixels)
+static constexpr int    kStep            = 2;                 // sampling grid step (pixels)
 static constexpr size_t FB_BASE_ADDRESS  = 0x20000000u;        // MiSTer scaler base (ASCAL)
 static constexpr size_t MAP_LEN          = 2048u * 1024u * 12u;// ~24 MiB mapping window
 static constexpr int    kPollMs          = 10;                 // ~100 Hz idle polling
