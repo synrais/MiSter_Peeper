@@ -154,9 +154,7 @@ static inline double stats_var(const Stats&s,int i){
     return (s.n>1) ? (s.m2[i]/(double)(s.n-1)) : 0.0;
 }
 
-// Try all four loaders on a sparse multi-offset sample **within one frame**.
-// Score by color variance + span sanity; pick best. If everything is too flat,
-// keep sampling more points via additional offsets for robustness.
+// Try all four loaders on a sparse multi-offset sample within one frame.
 static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
                                        uint16_t w, uint16_t h, uint16_t line){
     struct Cand { const char* name; Rgb16Loader fn; } C[4] = {
@@ -168,7 +166,6 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
 
     Stats S[4]; for(int i=0;i<4;i++) stats_init(S[i]);
 
-    // sample up to a few hundred points per candidate
     int samples = 0;
     for(int oi=0; oi<off_count; ++oi){
         int ox=off_table[oi][0], oy=off_table[oi][1];
@@ -185,7 +182,6 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
             }
             if(samples>1200) break;
         }
-        // after each offset, see if variance is sufficient to decide
         auto score=[&](const Stats& st){
             double vr=stats_var(st,0), vg=stats_var(st,1), vb=stats_var(st,2);
             double colorfulness = (vr-vg)*(vr-vg) + (vg-vb)*(vg-vb) + (vb-vr)*(vb-vr);
@@ -196,24 +192,20 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix,
             if(spanR<2) flat_penalty += 1.0;
             if(spanG<2) flat_penalty += 1.0;
             if(spanB<2) flat_penalty += 1.0;
-            // encourage green span (6 bits) to not be the smallest
             double shape_penalty = (spanG+1.0 < 0.8*(std::max(spanR,spanB)+1.0)) ? 0.5 : 0.0;
             return colorfulness - (1e6*flat_penalty + 1e5*shape_penalty);
         };
-        // decide if there is a clear winner
         double best=-1e300, second=-1e300; int bi=0;
         for(int i=0;i<4;i++){
             double sc=score(S[i]);
             if(sc>best){ second=best; best=sc; bi=i; }
             else if(sc>second){ second=sc; }
         }
-        // lock if we have enough samples and a decent margin
-        if(S[bi].n>64 && (best > second*1.2 + 1e5)){ // margin heuristic
+        if(S[bi].n>64 && (best > second*1.2 + 1e5)){
             fprintf(stderr,"info=rgb16_loader variant=%s samples=%llu\n", C[bi].name, (unsigned long long)S[bi].n);
             return C[bi].fn;
         }
     }
-    // fallback: just pick best after all samples
     double best=-1e300; int bi=0;
     auto final_score=[&](const Stats& st){
         double vr=stats_var(st,0), vg=stats_var(st,1), vb=stats_var(st,2);
@@ -255,12 +247,12 @@ int main(int argc,char**argv){
         fprintf(stderr,"error=header_not_found ty=%u\n",(unsigned)h.ty);
         munmap((void*)base,MAP_LEN); close(fd); return 3;
     }
-    const uint16_t header_len=be16(h.header_len_be);
-    const uint16_t width     =be16(h.width_be);
-    const uint16_t height    =be16(h.height_be);
-    const uint16_t line      =be16(h.line_be);
-    const ScalerPixelFormat fmt=(ScalerPixelFormat)h.pixel_fmt;
-    const bool triple = triple_buffered(h.attributes_be);
+    uint16_t header_len=be16(h.header_len_be);
+    uint16_t width     =be16(h.width_be);
+    uint16_t height    =be16(h.height_be);
+    uint16_t line      =be16(h.line_be);
+    ScalerPixelFormat fmt=(ScalerPixelFormat)h.pixel_fmt;
+    bool triple = triple_buffered(h.attributes_be);
 
     // Detect small vs large triple by probing for valid headers
     auto hdr_ok=[&](size_t off){
@@ -277,17 +269,12 @@ int main(int argc,char**argv){
         base + fb_off(large,2) + 5
     };
 
-    // Helpers
-    auto sum_fc=[&](){
-        uint16_t s = attr_ptrs[0][0];
-        if(triple){ s = (uint16_t)(s + attr_ptrs[1][0] + attr_ptrs[2][0]); }
-        return s;
-    };
-    auto choose_active_idx = [&](const uint8_t prev[3], const uint8_t curr[3])->int{
-        if(!triple) return 0;
-        for(int i=0;i<3;i++) if(curr[i]!=prev[i]) return i; // the one that changed
-        int idx=0; if(curr[1]>=curr[idx]) idx=1; if(curr[2]>=curr[idx]) idx=2; return idx; // fallback
-    };
+    // Keep last-seen geometry to detect core/scaler changes
+    uint16_t last_width  = width;
+    uint16_t last_height = height;
+    uint16_t last_line   = line;
+    uint8_t  last_fmt    = (uint8_t)fmt;
+    uint16_t last_header_len = header_len;
 
     // Pixel loaders for 24/32-bit
     auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
@@ -309,11 +296,44 @@ int main(int argc,char**argv){
 
     while(g_run){
         // Wait for next frame (low wake)
-        uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0){
+        uint16_t s0 = attr_ptrs[0][0] + (triple ? (uint16_t)(attr_ptrs[1][0]+attr_ptrs[2][0]) : 0);
+        while(g_run){
+            uint16_t s1 = attr_ptrs[0][0] + (triple ? (uint16_t)(attr_ptrs[1][0]+attr_ptrs[2][0]) : 0);
+            if(s1!=s0) break;
             if(g_poll_ms>0) usleep((useconds_t)(g_poll_ms*1000));
         }
         if(!g_run) break;
+
+        // Re-read header to detect core/scaler changes
+        FbHeader hc{}; memcpy(&hc,(const void*)base,sizeof(FbHeader));
+        uint16_t cur_header_len=be16(hc.header_len_be);
+        uint16_t cur_width     =be16(hc.width_be);
+        uint16_t cur_height    =be16(hc.height_be);
+        uint16_t cur_line      =be16(hc.line_be);
+        uint8_t  cur_fmt_u8    = hc.pixel_fmt;
+        ScalerPixelFormat cur_fmt = (ScalerPixelFormat)cur_fmt_u8;
+        bool     cur_triple    = triple_buffered(hc.attributes_be);
+
+        // If geometry or format changed: update and reset loader for 16-bit
+        if(cur_width!=last_width || cur_height!=last_height ||
+           cur_line!=last_line || cur_fmt_u8!=last_fmt ||
+           cur_header_len!=last_header_len || cur_triple!=triple)
+        {
+            last_width = cur_width; last_height = cur_height; last_line = cur_line;
+            last_fmt = cur_fmt_u8; last_header_len = cur_header_len; triple = cur_triple;
+            fmt = cur_fmt;
+            // Recompute triple buffer size flag
+            large = triple && !hdr_ok(0x00200000u) && hdr_ok(0x00800000u);
+
+            // Reset rgb16 autodetect unless forced by CLI
+            rgb16_loader = g_forced_loader;
+
+            // Also reset change timer baseline to avoid weird unchanged times across modes
+            last_hash = 0; first = true;
+            fprintf(stderr,"info=scaler_changed w=%u h=%u line=%u fmt=%u triple=%u\n",
+                    (unsigned)cur_width,(unsigned)cur_height,(unsigned)cur_line,
+                    (unsigned)cur_fmt_u8,(unsigned)cur_triple);
+        }
 
         // Pick active buffer (the one that ticked)
         uint8_t curr_fc[3] = {
@@ -321,11 +341,13 @@ int main(int argc,char**argv){
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
             static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
         };
-        int buf = choose_active_idx(prev_fc, curr_fc);
+        int idx=0; if(triple){ for(int i=0;i<3;i++) if(curr_fc[i]!=prev_fc[i]) { idx=i; break; }
+                               if(curr_fc[1]>=curr_fc[idx]) idx=1; if(curr_fc[2]>=curr_fc[idx]) idx=2; }
+        int buf = idx;
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
         // Sample that buffer once (no retries)
-        const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + header_len;
+        const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + last_header_len;
 
         const int xs=kStep, ys=kStep;
         uint32_t hsh=2166136261u;
@@ -338,13 +360,12 @@ int main(int argc,char**argv){
         uint16_t mode_count = 0;
 
         if(fmt==RGB24){
-            for(unsigned y=0;y<height;y+=ys){
-                const volatile uint8_t* row=pix + (size_t)y*line;
-                for(unsigned x=0;x<width;x+=xs){
+            for(unsigned y=0;y<last_height;y+=ys){
+                const volatile uint8_t* row=pix + (size_t)y*last_line;
+                for(unsigned x=0;x<last_width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-                    // quantize to 5-6-5
                     uint32_t key = ((uint32_t)(r>>3)<<11) | ((uint32_t)(g>>2)<<5) | (uint32_t)(b>>3);
                     if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
                     else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
@@ -352,9 +373,9 @@ int main(int argc,char**argv){
                 }
             }
         } else if(fmt==RGBA32){
-            for(unsigned y=0;y<height;y+=ys){
-                const volatile uint8_t* row=pix + (size_t)y*line;
-                for(unsigned x=0;x<width;x+=xs){
+            for(unsigned y=0;y<last_height;y+=ys){
+                const volatile uint8_t* row=pix + (size_t)y*last_line;
+                for(unsigned x=0;x<last_width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
@@ -366,11 +387,11 @@ int main(int argc,char**argv){
             }
         } else { // RGB16 family
             if(!rgb16_loader){
-                rgb16_loader = choose_rgb16_loader(pix, width, height, line);
+                rgb16_loader = choose_rgb16_loader(pix, last_width, last_height, last_line);
             }
-            for(unsigned y=0;y<height;y+=ys){
-                const volatile uint8_t* row=pix + (size_t)y*line;
-                for(unsigned x=0;x<width;x+=xs){
+            for(unsigned y=0;y<last_height;y+=ys){
+                const volatile uint8_t* row=pix + (size_t)y*last_line;
+                for(unsigned x=0;x<last_width;x+=xs){
                     const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; rgb16_loader(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
