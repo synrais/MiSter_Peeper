@@ -1,5 +1,5 @@
 // mister_peeper.cpp — per-frame, buffer-aware, no-retry, minimal output + inline FPS
-// Prints (every frame):  
+// Each frame prints:
 //   time=HH:MM:SS  unchanged=secs  fps=XX.X  avg_rgb=#RRGGBB  center_rgb=#RRGGBB
 
 #include <cstdint>
@@ -46,18 +46,13 @@ static inline size_t fb_off(bool large, uint8_t idx){
 static volatile bool g_run=true;
 static void on_sig(int){ g_run=false; }
 
-static inline uint64_t now_ns(){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec;
-}
+static inline uint64_t now_ns(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec; }
+static inline void    sleep_200us(){ struct timespec rq{0,200000}; nanosleep(&rq,nullptr); } // 0.2 ms high-res sleep
+
 static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){
-    h^=((uint32_t)r<<16)^((uint32_t)g<<8)^(uint32_t)b;
-    h^=h<<13; h^=h>>17; h^=h<<5; return h;
+    h^=((uint32_t)r<<16)^((uint32_t)g<<8)^(uint32_t)b; h^=h<<13; h^=h>>17; h^=h<<5; return h;
 }
-static inline void fmt_hms(double s,char* out,size_t n){
-    int S=(int)s; int H=S/3600; int M=(S%3600)/60; S%=60;
-    snprintf(out,n,"%02d:%02d:%02d",H,M,S);
-}
+static inline void fmt_hms(double s,char* out,size_t n){ int S=(int)s; int H=S/3600; int M=(S%3600)/60; S%=60; snprintf(out,n,"%02d:%02d:%02d",H,M,S); }
 
 int main(){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
@@ -69,7 +64,8 @@ int main(){
     volatile uint8_t* base=(volatile uint8_t*)map;
 
     FbHeader h{}; memcpy(&h,(const void*)base,sizeof(FbHeader));
-    if(h.ty!=0x01){ fprintf(stderr,"error=header_not_found\n"); return 3; }
+    if(h.ty!=0x01){ fprintf(stderr,"error=header_not_found\n"); munmap((void*)base,MAP_LEN); close(fd); return 3; }
+
     const uint16_t header_len=be16(h.header_len_be);
     const uint16_t width     =be16(h.width_be);
     const uint16_t height    =be16(h.height_be);
@@ -103,12 +99,7 @@ int main(){
 
     auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
-    auto load_rgb565=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){
-        uint16_t v=(uint16_t)p[0]|((uint16_t)p[1]<<8);
-        r=(uint8_t)(((v>>11)&0x1F)*255/31);
-        g=(uint8_t)(((v>>5)&0x3F)*255/63);
-        b=(uint8_t)(( v     &0x1F)*255/31);
-    };
+    auto load_rgb565=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ uint16_t v=(uint16_t)p[0]|((uint16_t)p[1]<<8); r=(uint8_t)(((v>>11)&0x1F)*255/31); g=(uint8_t)(((v>>5)&0x3F)*255/63); b=(uint8_t)((v&0x1F)*255/31); };
 
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
@@ -120,12 +111,15 @@ int main(){
         static_cast<uint8_t>(triple ? attr_ptrs[2][0] : 0)
     };
 
-    // FPS state
-    uint64_t last_frame_ns=start_ns;
+    // FPS EMA
+    uint64_t last_frame_ns = start_ns;
+    double fps_ema = 0.0;
+    const double alpha = 0.2; // smoothing
 
     while(g_run){
+        // wait for next frame using high-res nanosleep to avoid 10ms rounding
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(1000);
+        while(g_run && sum_fc()==s0) sleep_200us();
         if(!g_run) break;
 
         uint8_t curr_fc[3] = {
@@ -187,23 +181,18 @@ int main(){
         double b_avg = n? (double)bs/n : 0.0;
 
         if(first){
-            last_hash=hsh; last_change_ns=t_ns;
-            last_r=r_avg; last_g=g_avg; last_b=b_avg;
-            first=false;
+            last_hash=hsh; last_change_ns=t_ns; last_r=r_avg; last_g=g_avg; last_b=b_avg; first=false;
         } else if(hsh!=last_hash){
             double dr=fabs(r_avg-last_r), dg=fabs(g_avg-last_g), db=fabs(b_avg-last_b);
-            if((dr+dg+db) >= kTolerance){
-                last_change_ns=t_ns;
-                last_hash=hsh; last_r=r_avg; last_g=g_avg; last_b=b_avg;
-            } else {
-                last_hash=hsh;
-            }
+            if((dr+dg+db) >= kTolerance){ last_change_ns=t_ns; last_hash=hsh; last_r=r_avg; last_g=g_avg; last_b=b_avg; }
+            else { last_hash=hsh; }
         }
 
-        // FPS instantaneous
+        // instantaneous + smoothed FPS
         double frame_dt = (t_ns - last_frame_ns) / 1e9;
         last_frame_ns = t_ns;
-        double fps = frame_dt > 0 ? 1.0 / frame_dt : 0.0;
+        double fps_inst = frame_dt > 0 ? 1.0 / frame_dt : 0.0;
+        fps_ema = (fps_ema==0.0) ? fps_inst : (alpha*fps_inst + (1.0-alpha)*fps_ema);
 
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
@@ -211,7 +200,7 @@ int main(){
         unsigned R=(unsigned)r_avg, G=(unsigned)g_avg, B=(unsigned)b_avg;
 
         printf("time=%s  unchanged=%.3f  fps=%.1f  avg_rgb=#%02X%02X%02X  center_rgb=#%02X%02X%02X\n",
-               tbuf, unchanged_s, fps, R,G,B, Rc,Gc,Bc);
+               tbuf, unchanged_s, fps_ema, R,G,B, Rc,Gc,Bc);
         fflush(stdout);
     }
 
