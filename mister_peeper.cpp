@@ -1,6 +1,5 @@
-// mister_peeper.cpp — frame-paced, hash-timed unchanged, avg & dominant color
-// Prints once per new frame:
-//   time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB (Name)  dom_rgb=#RRGGBB (Name)
+// mister_peeper.cpp — per-frame, buffer-aware, hash-based unchanged timer, minimal output
+// Prints: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  color=Name
 
 #include <cstdint>
 #include <cstdio>
@@ -13,9 +12,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
-#include <algorithm>
 
 static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
+// kTolerance removed: unchanged is now driven purely by the hash
 static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;
 static constexpr size_t MAP_LEN         = 2048u * 1024u * 12u; // ~24 MiB
 
@@ -50,31 +49,16 @@ static inline uint64_t now_ns(){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec;
 }
-static inline void fmt_hms(double s,char* out,size_t n){
-    int S=(int)s; int H=S/3600; int M=(S%3600)/60; S%=60;
-    snprintf(out,n,"%02d:%02d:%02d",H,M,S);
-}
 static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){
     h^=((uint32_t)r<<16)^((uint32_t)g<<8)^(uint32_t)b;
     h^=h<<13; h^=h>>17; h^=h<<5; return h;
 }
-
-// --- sRGB <-> linear LUT ---
-static uint32_t g_lut_lin[256]; // linear * 2^20
-static inline void init_lut(){
-    for(int i=0;i<256;i++){
-        double s=i/255.0;
-        double lin = (s<=0.04045)? (s/12.92) : pow((s+0.055)/1.055,2.4);
-        g_lut_lin[i]=(uint32_t)llround(lin*(double)(1u<<20));
-    }
-}
-static inline uint8_t lin_to_srgb(double lin){
-    if(lin<=0.0) return 0; if(lin>=1.0) return 255;
-    double s = (lin<=0.0031308)? 12.92*lin : 1.055*pow(lin,1.0/2.4)-0.055;
-    int v=(int)llround(s*255.0); return (v<0?0:v>255?255:v);
+static inline void fmt_hms(double s,char* out,size_t n){
+    int S=(int)s; int H=S/3600; int M=(S%3600)/60; S%=60;
+    snprintf(out,n,"%02d:%02d:%02d",H,M,S);
 }
 
-// --- human-readable palette ---
+// Simple nearest-named-color mapper (RGB Euclidean)
 struct NamedColor { const char* name; uint8_t r,g,b; };
 static const NamedColor kNamed[] = {
     {"Black",0,0,0}, {"White",255,255,255}, {"Silver",192,192,192}, {"Gray",128,128,128},
@@ -96,14 +80,15 @@ static inline const char* name_for_rgb(unsigned R, unsigned G, unsigned B){
 
 int main(){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
-    init_lut();
 
+    // Map scaler
     int fd=open("/dev/mem",O_RDONLY|O_SYNC);
     if(fd<0){ perror("open(/dev/mem)"); return 1; }
     void* map=mmap(nullptr,MAP_LEN,PROT_READ,MAP_SHARED,fd,FB_BASE_ADDRESS);
     if(map==MAP_FAILED){ perror("mmap"); close(fd); return 1; }
     volatile uint8_t* base=(volatile uint8_t*)map;
 
+    // Read header once for geometry/format
     FbHeader h{}; memcpy(&h,(const void*)base,sizeof(FbHeader));
     if(h.ty!=0x01){
         fprintf(stderr,"error=header_not_found ty=%u\n",(unsigned)h.ty);
@@ -116,6 +101,7 @@ int main(){
     const ScalerPixelFormat fmt=(ScalerPixelFormat)h.pixel_fmt;
     const bool triple = triple_buffered(h.attributes_be);
 
+    // Detect small vs large triple by probing for valid headers
     auto hdr_ok=[&](size_t off){
         if(off+sizeof(FbHeader)>MAP_LEN) return false;
         FbHeader t{}; memcpy(&t,(const void*)(base+off),sizeof(FbHeader));
@@ -123,11 +109,14 @@ int main(){
     };
     bool large = triple && !hdr_ok(0x00200000u) && hdr_ok(0x00800000u);
 
+    // Attribute pointers (frame counters at header + 5)
     volatile const uint8_t* attr_ptrs[3] = {
         base + 5,
         base + fb_off(large,1) + 5,
         base + fb_off(large,2) + 5
     };
+
+    // Helpers
     auto sum_fc=[&](){
         uint16_t s = attr_ptrs[0][0];
         if(triple){ s = (uint16_t)(s + attr_ptrs[1][0] + attr_ptrs[2][0]); }
@@ -135,10 +124,11 @@ int main(){
     };
     auto choose_active_idx = [&](const uint8_t prev[3], const uint8_t curr[3])->int{
         if(!triple) return 0;
-        for(int i=0;i<3;i++) if(curr[i]!=prev[i]) return i;
-        int idx=0; if(curr[1]>=curr[idx]) idx=1; if(curr[2]>=curr[idx]) idx=2; return idx;
+        for(int i=0;i<3;i++) if(curr[i]!=prev[i]) return i; // the one that changed
+        int idx=0; if(curr[1]>=curr[idx]) idx=1; if(curr[2]>=curr[idx]) idx=2; return idx; // fallback
     };
 
+    // Pixel loaders
     auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgb565=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){
@@ -148,9 +138,11 @@ int main(){
         b=(uint8_t)(( v     &0x1F)*255/31);
     };
 
+    // Change detection state
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
 
+    // Previous per-buffer counters (casts silence narrowing warnings)
     uint8_t prev_fc[3] = {
         attr_ptrs[0][0],
         static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
@@ -158,10 +150,13 @@ int main(){
     };
 
     while(g_run){
+        // Wait for next frame; poll gently at ~100 Hz (10 ms)
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(2000); // ~2 ms poll
+        while(g_run && sum_fc()==s0) usleep(10000); // 100 Hz lock
+
         if(!g_run) break;
 
+        // Pick active buffer (the one that ticked)
         uint8_t curr_fc[3] = {
             attr_ptrs[0][0],
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
@@ -170,81 +165,63 @@ int main(){
         int buf = choose_active_idx(prev_fc, curr_fc);
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
+        // Sample that buffer once (no retries)
         const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + header_len;
 
         const int xs=kStep, ys=kStep;
-        uint64_t rlin=0,glin=0,blin=0,n=0;
+        uint64_t rs=0,gs=0,bs=0,n=0;
         uint32_t hsh=2166136261u;
-
-        // histogram bins
-        static const int kBins=32; // 5 bits/channel
-        static uint32_t hist[kBins*kBins*kBins];
-        memset(hist,0,sizeof(hist));
-
-        auto bin = [&](uint8_t r,uint8_t g,uint8_t b){
-            int rb=r>>3, gb=g>>3, bb=b>>3;
-            return (rb<<10)|(gb<<5)|bb;
-        };
 
         if(fmt==RGB24){
             for(unsigned y=0;y<height;y+=ys){
-                const volatile uint8_t* row=pix+(size_t)y*line;
+                const volatile uint8_t* row=pix + (size_t)y*line;
                 for(unsigned x=0;x<width;x+=xs){
-                    const volatile uint8_t* p=row+(size_t)x*3;
+                    const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
-                    rlin+=g_lut_lin[r]; glin+=g_lut_lin[g]; blin+=g_lut_lin[b];
-                    hist[bin(r,g,b)]++; n++; hsh=hash_rgb(hsh,r,g,b);
+                    rs+=r; gs+=g; bs+=b; n++; hsh=hash_rgb(hsh,r,g,b);
                 }
             }
         } else if(fmt==RGBA32){
             for(unsigned y=0;y<height;y+=ys){
-                const volatile uint8_t* row=pix+(size_t)y*line;
+                const volatile uint8_t* row=pix + (size_t)y*line;
                 for(unsigned x=0;x<width;x+=xs){
-                    const volatile uint8_t* p=row+(size_t)x*4;
+                    const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
-                    rlin+=g_lut_lin[r]; glin+=g_lut_lin[g]; blin+=g_lut_lin[b];
-                    hist[bin(r,g,b)]++; n++; hsh=hash_rgb(hsh,r,g,b);
+                    rs+=r; gs+=g; bs+=b; n++; hsh=hash_rgb(hsh,r,g,b);
                 }
             }
-        } else {
+        } else { // RGB16
             for(unsigned y=0;y<height;y+=ys){
-                const volatile uint8_t* row=pix+(size_t)y*line;
+                const volatile uint8_t* row=pix + (size_t)y*line;
                 for(unsigned x=0;x<width;x+=xs){
-                    const volatile uint8_t* p=row+(size_t)x*2;
+                    const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; load_rgb565(p,r,g,b);
-                    rlin+=g_lut_lin[r]; glin+=g_lut_lin[g]; blin+=g_lut_lin[b];
-                    hist[bin(r,g,b)]++; n++; hsh=hash_rgb(hsh,r,g,b);
+                    rs+=r; gs+=g; bs+=b; n++; hsh=hash_rgb(hsh,r,g,b);
                 }
             }
         }
 
+        // Change detection: hash only
         uint64_t t_ns=now_ns();
-        if(first){ last_hash=hsh; last_change_ns=t_ns; first=false; }
-        else if(hsh!=last_hash){ last_hash=hsh; last_change_ns=t_ns; }
+        if(first){
+            last_hash=hsh; last_change_ns=t_ns; first=false;
+        } else if(hsh!=last_hash){
+            last_hash=hsh;
+            last_change_ns=t_ns;
+        }
 
-        // linear average -> sRGB
-        double inv = n? 1.0/n : 0.0;
-        double r_lin=(double)rlin*inv/(double)(1u<<20);
-        double g_lin=(double)glin*inv/(double)(1u<<20);
-        double b_lin=(double)blin*inv/(double)(1u<<20);
-        uint8_t R=lin_to_srgb(r_lin);
-        uint8_t G=lin_to_srgb(g_lin);
-        uint8_t B=lin_to_srgb(b_lin);
-
-        // dominant color from histogram
-        int best_i=0; uint32_t best_c=0;
-        for(int i=0;i<kBins*kBins*kBins;i++) if(hist[i]>best_c){ best_c=hist[i]; best_i=i; }
-        int rb=(best_i>>10)&31, gb=(best_i>>5)&31, bb=best_i&31;
-        uint8_t Rd=rb*8+4, Gd=gb*8+4, Bd=bb*8+4;
-
+        // Averages and presentation
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
 
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X (%s)  dom_rgb=#%02X%02X%02X (%s)\n",
-               tbuf, unchanged_s,
-               R,G,B,  name_for_rgb(R,G,B),
-               Rd,Gd,Bd, name_for_rgb(Rd,Gd,Bd));
+        unsigned R=(unsigned)(n? (double)rs/n : 0.0);
+        unsigned G=(unsigned)(n? (double)gs/n : 0.0);
+        unsigned B=(unsigned)(n? (double)bs/n : 0.0);
+        const char* cname = name_for_rgb(R,G,B);
+
+        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s\n",
+               tbuf, unchanged_s, R,G,B, cname);
         fflush(stdout);
     }
 
