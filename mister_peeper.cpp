@@ -12,7 +12,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
-#include <unordered_map>
 #include <climits>
 
 static constexpr int    kStep      = 16;   // sparse grid (fast & sufficient)
@@ -136,6 +135,11 @@ static Rgb16Loader choose_rgb16_loader(const volatile uint8_t* pix, uint16_t w, 
     return cands[best_i].fn;
 }
 
+// ---- 5-6-5 histogram with epoch trick (fast, no clears) ----
+static uint32_t g_epoch = 1;
+static uint32_t g_stamp[65536];
+static uint16_t g_count[65536];
+
 int main(){
     signal(SIGINT,on_sig); signal(SIGTERM,on_sig);
 
@@ -190,7 +194,7 @@ int main(){
     auto load_rgb24=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
     auto load_rgba32=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ r=p[0]; g=p[1]; b=p[2]; };
 
-    // Hash-only change detection state
+    // Change detection state
     uint32_t last_hash=0; bool first=true;
     uint64_t start_ns=now_ns(), last_change_ns=start_ns;
 
@@ -205,12 +209,12 @@ int main(){
     Rgb16Loader rgb16_loader = nullptr;
 
     while(g_run){
-        // Wait for next frame (≈ refresh rate). Polled gently.
+        // Wait for next frame (low wake like the old version)
         uint16_t s0 = sum_fc();
-        while(g_run && sum_fc()==s0) usleep(1000);
+        while(g_run && sum_fc()==s0) usleep(10000); // ~100 Hz
         if(!g_run) break;
 
-        // Pick active buffer (the one that ticked)
+        // Pick active buffer
         uint8_t curr_fc[3] = {
             attr_ptrs[0][0],
             static_cast<uint8_t>(triple ? attr_ptrs[1][0] : 0),
@@ -219,15 +223,18 @@ int main(){
         int buf = choose_active_idx(prev_fc, curr_fc);
         prev_fc[0]=curr_fc[0]; prev_fc[1]=curr_fc[1]; prev_fc[2]=curr_fc[2];
 
-        // Sample that buffer once (no retries)
+        // Sample once (no retries)
         const volatile uint8_t* pix = base + fb_off(large,(uint8_t)buf) + header_len;
 
         const int xs=kStep, ys=kStep;
         uint32_t hsh=2166136261u;
 
-        // Dominant color counting (over sampled grid)
-        std::unordered_map<uint32_t,uint32_t> hist;
-        hist.reserve(1u<<16);
+        // epoch for this frame
+        uint32_t const epoch = ++g_epoch; // wrap ok
+
+        // on-the-fly mode tracking
+        uint32_t mode_key = 0;
+        uint16_t mode_count = 0;
 
         if(fmt==RGB24){
             for(unsigned y=0;y<height;y+=ys){
@@ -236,7 +243,16 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*3;
                     uint8_t r,g,b; load_rgb24(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-                    ++hist[((uint32_t)r<<16)|((uint32_t)g<<8)|b];
+
+                    // quantize to 5-6-5
+                    uint32_t r5 = (uint32_t)(r >> 3);
+                    uint32_t g6 = (uint32_t)(g >> 2);
+                    uint32_t b5 = (uint32_t)(b >> 3);
+                    uint32_t key = (r5<<11) | (g6<<5) | b5;
+
+                    if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
+                    else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
+                    if(mode_count==0){ mode_count=1; mode_key=key; }
                 }
             }
         } else if(fmt==RGBA32){
@@ -246,10 +262,18 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*4;
                     uint8_t r,g,b; load_rgba32(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-                    ++hist[((uint32_t)r<<16)|((uint32_t)g<<8)|b];
+
+                    uint32_t r5 = (uint32_t)(r >> 3);
+                    uint32_t g6 = (uint32_t)(g >> 2);
+                    uint32_t b5 = (uint32_t)(b >> 3);
+                    uint32_t key = (r5<<11) | (g6<<5) | b5;
+
+                    if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
+                    else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
+                    if(mode_count==0){ mode_count=1; mode_key=key; }
                 }
             }
-        } else { // RGB16 family (auto-detect)
+        } else { // RGB16 family (auto-detect once)
             if(!rgb16_loader){
                 rgb16_loader = choose_rgb16_loader(pix, width, height, line);
             }
@@ -259,7 +283,15 @@ int main(){
                     const volatile uint8_t* p=row + (size_t)x*2;
                     uint8_t r,g,b; rgb16_loader(p,r,g,b);
                     hsh=hash_rgb(hsh,r,g,b);
-                    ++hist[((uint32_t)r<<16)|((uint32_t)g<<8)|b];
+
+                    uint32_t r5 = (uint32_t)(r >> 3);
+                    uint32_t g6 = (uint32_t)(g >> 2);
+                    uint32_t b5 = (uint32_t)(b >> 3);
+                    uint32_t key = (r5<<11) | (g6<<5) | b5;
+
+                    if(g_stamp[key]!=epoch){ g_stamp[key]=epoch; g_count[key]=1; }
+                    else { uint16_t c = ++g_count[key]; if(c>mode_count){ mode_count=c; mode_key=key; } }
+                    if(mode_count==0){ mode_count=1; mode_key=key; }
                 }
             }
         }
@@ -269,18 +301,12 @@ int main(){
         if(first){ last_hash=hsh; last_change_ns=t_ns; first=false; }
         else if(hsh!=last_hash){ last_change_ns=t_ns; last_hash=hsh; }
 
-        // Dominant color (mode of sampled colors)
-        uint32_t dom_key = 0, dom_count = 0;
-        for(const auto& kv : hist){
-            if(kv.second > dom_count || (kv.second==dom_count && kv.first < dom_key)){
-                dom_key = kv.first; dom_count = kv.second;
-            }
-        }
-        uint8_t Rd = (uint8_t)((dom_key>>16)&0xFF);
-        uint8_t Gd = (uint8_t)((dom_key>>8 )&0xFF);
-        uint8_t Bd = (uint8_t)( dom_key      &0xFF);
+        // Expand 5-6-5 bin to 8-bit for output
+        uint8_t Rd = (uint8_t)(((mode_key >> 11) & 0x1F) * 255 / 31);
+        uint8_t Gd = (uint8_t)(((mode_key >> 5 ) & 0x3F) * 255 / 63);
+        uint8_t Bd = (uint8_t)((  mode_key        & 0x1F) * 255 / 31);
 
-        // Output
+        // Output (exact flow you asked for)
         double unchanged_s=(t_ns-last_change_ns)/1e9;
         double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
@@ -288,8 +314,7 @@ int main(){
         const char* dom_name = nearest_color_name(Rd,Gd,Bd);
 
         printf("time=%s  unchanged=%.3f  dom_rgb=#%02X%02X%02X (%s)\n",
-               tbuf, unchanged_s,
-               Rd,Gd,Bd, dom_name);
+               tbuf, unchanged_s, Rd, Gd, Bd, dom_name);
         fflush(stdout);
     }
 
