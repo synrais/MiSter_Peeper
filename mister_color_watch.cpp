@@ -1,4 +1,4 @@
-// mister_color_watch.cpp
+// mister_peeper.cpp
 // Standalone color monitor for MiSTer scaler output
 // Fixed defaults: step=16, tolerance=3.0
 // Only option: --sleep-us N   (default 2500µs)
