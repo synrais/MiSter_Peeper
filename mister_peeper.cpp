@@ -1,6 +1,6 @@
-// mister_peeper.cpp — minimal, fast screen checker for MiSTer scaler
-// Output per line: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  center_rgb=#RRGGBB
-// Only option: --sleep-us N  (default 5000 µs)
+// mister_peeper.cpp — minimal, fast, low-CPU screen checker for MiSTer scaler
+// Output per line: time=HH:MM:SS  unchanged=secs  avg_rgb=#RRGGBB  color=Name
+// Only option: --sleep-us N  (default 10000 µs ≈ 100 checks/sec)
 
 #include <cstdint>
 #include <cstdio>
@@ -16,7 +16,7 @@
 
 static constexpr int    kStep      = 16;     // sampling grid (fixed)
 static constexpr double kTolerance = 3.0;    // L1 on avg RGB to count as "changed"
-static       int        gSleepUs   = 5000;   // overridable via --sleep-us
+static       int        gSleepUs   = 10000;  // ~100 Hz (overridable via --sleep-us)
 
 // MiSTer scaler mapping
 static constexpr size_t FB_BASE_ADDRESS = 0x20000000u;
@@ -39,12 +39,6 @@ struct FbHeader {
 #pragma pack(pop)
 
 static inline uint16_t be16(uint16_t x){ return (uint16_t)((x>>8)|(x<<8)); }
-static inline bool triple_buffered(uint16_t attr_be){ return (be16(attr_be) & (1u<<4)) != 0; }
-static inline size_t fb_off(bool large, uint8_t idx){
-    if(idx==0) return 0;
-    return large ? (idx==1 ? 0x00800000u : 0x01000000u)
-                 : (idx==1 ? 0x00200000u : 0x00400000u);
-}
 
 static volatile bool g_run=true;
 static void on_sig(int){ g_run=false; }
@@ -52,6 +46,19 @@ static void on_sig(int){ g_run=false; }
 static inline uint64_t now_ns(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000000ull+ts.tv_nsec; }
 static inline uint32_t hash_rgb(uint32_t h,uint8_t r,uint8_t g,uint8_t b){ h^=((uint32_t)r<<16)^((uint32_t)g<<8)^(uint32_t)b; h^=h<<13; h^=h>>17; h^=h<<5; return h; }
 static inline void fmt_hms(double s,char* out,size_t n){ int S=(int)s; int H=S/3600; int M=(S%3600)/60; S%=60; snprintf(out,n,"%02d:%02d:%02d",H,M,S); }
+
+// crude color naming
+static const char* color_name(unsigned R,unsigned G,unsigned B){
+    if(R<30&&G<30&&B<30) return "black";
+    if(R>220&&G>220&&B>220) return "white";
+    if(R>200&&G<80&&B<80) return "red";
+    if(R<80&&G>200&&B<80) return "green";
+    if(R<80&&G<80&&B>200) return "blue";
+    if(R>200&&G>200&&B<100) return "yellow";
+    if(R>200&&G<80&&B>200) return "magenta";
+    if(R<80&&G>200&&B>200) return "cyan";
+    return "mixed";
+}
 
 int main(int argc,char**argv){
     // only --sleep-us
@@ -78,20 +85,9 @@ int main(int argc,char**argv){
     const uint16_t height    =be16(h.height_be);
     const uint16_t line      =be16(h.line_be);
     const ScalerPixelFormat fmt=(ScalerPixelFormat)h.pixel_fmt;
-    const bool triple = triple_buffered(h.attributes_be);
 
-    // detect small vs large triple buffer by probing headers
-    auto hdr_ok=[&](size_t off){ if(off+sizeof(FbHeader)>MAP_LEN) return false; FbHeader t{}; memcpy(&t,(const void*)(base+off),sizeof(FbHeader)); return t.ty==0x01 && t.pixel_fmt<=2; };
-    bool large = triple && !hdr_ok(0x00200000u) && hdr_ok(0x00800000u);
-
-    // pointers
+    // pointer to buffer 0 only
     const volatile uint8_t* pix0 = base + header_len;
-    volatile const uint8_t* fc_ptrs[3] = {
-        base + 5,
-        base + fb_off(large,1) + 5,
-        base + fb_off(large,2) + 5
-    };
-    auto fc_sum=[&](){ uint8_t s=fc_ptrs[0][0]; if(triple){ s=(uint8_t)(s + fc_ptrs[1][0] + fc_ptrs[2][0]); } return s; };
 
     // change detection state
     uint32_t last_hash=0; bool first=true;
@@ -104,14 +100,6 @@ int main(int argc,char**argv){
     auto load_rgb565=[](const volatile uint8_t*p,uint8_t&r,uint8_t&g,uint8_t&b){ uint16_t v=(uint16_t)p[0]|((uint16_t)p[1]<<8); r=((v>>11)&0x1F)*255/31; g=((v>>5)&0x3F)*255/63; b=(v&0x1F)*255/31; };
 
     while(g_run){
-        // light frame sync (keeps CPU/bus low but responsive)
-        uint8_t f0=fc_sum();
-        for(int i=0;i<2 && g_run;i++){
-            if(fc_sum()!=f0) break;
-            if(gSleepUs>0) usleep(gSleepUs);
-        }
-        if(!g_run) break;
-
         // sample sparse grid
         const int xs=kStep, ys=kStep;
         uint64_t rs=0,gs=0,bs=0,n=0;
@@ -152,17 +140,6 @@ int main(int argc,char**argv){
         double b_avg = n ? (double)bs/n : 0.0;
         unsigned R=(unsigned)r_avg, G=(unsigned)g_avg, B=(unsigned)b_avg;
 
-        // center pixel
-        unsigned cx=width/2, cy=height/2;
-        uint8_t Rc=0,Gc=0,Bc=0;
-        if(fmt==RGB24){
-            const volatile uint8_t* p=pix0 + (size_t)cy*line + (size_t)cx*3; Rc=p[0]; Gc=p[1]; Bc=p[2];
-        } else if(fmt==RGBA32){
-            const volatile uint8_t* p=pix0 + (size_t)cy*line + (size_t)cx*4; Rc=p[0]; Gc=p[1]; Bc=p[2];
-        } else {
-            const volatile uint8_t* p=pix0 + (size_t)cy*line + (size_t)cx*2; uint8_t r,g,b; load_rgb565(p,r,g,b); Rc=r; Gc=g; Bc=b;
-        }
-
         // change detection (hash + tolerance on avg)
         uint64_t t_ns=now_ns();
         if(first){
@@ -176,12 +153,10 @@ int main(int argc,char**argv){
 
         // print minimal line
         double unchanged_s=(t_ns-last_change_ns)/1e9;
-        double elapsed_s  =(t_ns-now_ns()+ (double)(t_ns - t_ns))/1e9; // avoid extra syscalls? (we'll compute fresh)
-        elapsed_s = (now_ns()- (t_ns - (now_ns()-t_ns)))/1e9; // but that's silly; just compute from start
-        elapsed_s = (now_ns() - start_ns)/1e9;
+        double elapsed_s  =(t_ns-start_ns)/1e9;
         char tbuf[16]; fmt_hms(elapsed_s,tbuf,sizeof(tbuf));
-        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  center_rgb=#%02X%02X%02X\n",
-               tbuf, unchanged_s, R,G,B, Rc,Gc,Bc);
+        printf("time=%s  unchanged=%.3f  avg_rgb=#%02X%02X%02X  color=%s\n",
+               tbuf, unchanged_s, R,G,B, color_name(R,G,B));
         fflush(stdout);
 
         if(gSleepUs>0) usleep(gSleepUs);
