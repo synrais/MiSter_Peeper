@@ -193,20 +193,22 @@ int main() {
             snprintf(hex_color, sizeof(hex_color), "#%02X%02X%02X", dom_r, dom_g, dom_b);
             const char *human_color = nearest_color_name(dom_r, dom_g, dom_b);
 
-            // --- Build output line ---
-            char line[1400];
-            int len = snprintf(line, sizeof(line),
-                "Output=1 | StaticTime=%.1f sec | RGB=%s -> %s | FPS=%6.2f | "
-                "Resolution=%4dx%-4d -> %4dx%-4d | Game=%s",
-                static_seconds, hex_color, human_color, fps,
-                width, height, out_w, out_h, rom);
-
-            printf("\r%s", line);
-            if (len < last_len) {
-                for (int i = 0; i < last_len - len; i++) putchar(' ');
-            }
-            last_len = len;
-            fflush(stdout);
+			// --- Build output line ---
+			const char *output = (buffer[0] == 1 && buffer[1] == 1) ? "YES" : "NO";
+			
+			char line[1400];
+			int len = snprintf(line, sizeof(line),
+				"Output=%s | StaticTime=%.1f sec | RGB=%s -> %s | FPS=%.2f | "
+				"Resolution=%dx%d -> %dx%d | Game=%s",
+				output, static_seconds, hex_color, human_color, fps,
+				width, height, out_w, out_h, rom);
+			
+			printf("\r%s", line);
+			if (len < last_len) {
+				for (int i = 0; i < last_len - len; i++) putchar(' ');
+			}
+			last_len = len;
+			fflush(stdout);
         }
 
         usleep(2000);
