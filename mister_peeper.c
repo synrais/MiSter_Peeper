@@ -92,7 +92,8 @@ int main() {
 
     // Static detection
     static uint32_t last_hash = 0;
-    static int static_counter = 0;
+    static int static_active = 0;
+    static struct timespec static_start, static_now;
 
     while (1) {
         uint8_t *buffer = map;
@@ -165,13 +166,21 @@ int main() {
             }
 
             if (hash == last_hash) {
-                static_counter++;
+                if (!static_active) {
+                    static_active = 1;
+                    clock_gettime(CLOCK_MONOTONIC, &static_start);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &static_now);
             } else {
-                static_counter = 0;
+                static_active = 0;
                 last_hash = hash;
             }
 
-            double static_seconds = static_counter * elapsed;  // convert ticks → seconds
+            double static_seconds = 0.0;
+            if (static_active) {
+                static_seconds = (static_now.tv_sec - static_start.tv_sec) +
+                                 (static_now.tv_nsec - static_start.tv_nsec) / 1e9;
+            }
 
             uint8_t dom_r=0, dom_g=0, dom_b=0;
             if (sample_count > 0) {
