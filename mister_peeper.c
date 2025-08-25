@@ -198,7 +198,7 @@ int main() {
 			
 			char line[1400];
 			int len = snprintf(line, sizeof(line),
-				"Output=%s | StaticTime=%.1f sec | RGB=%s -> %s | FPS=%.2f | "
+				"Output=%s | StaticTime=%.1f | RGB=%s -> %s | FPS=%.2f | "
 				"Resolution=%dx%d -> %dx%d | Game=%s",
 				output, static_seconds, hex_color, human_color, fps,
 				width, height, out_w, out_h, rom);
