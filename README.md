@@ -1,6 +1,5 @@
 # MiSTer_Peeper
 
-# mister_peeper
 
 A lightweight C utility for **MiSTer FPGA** that reads scaler registers and reports live video output status, FPS, static detection, and approximate dominant color of the video stream.  
 It uses `/dev/mem` to directly map the scaler buffer and sample pixels with very low CPU overhead (<1%).  
